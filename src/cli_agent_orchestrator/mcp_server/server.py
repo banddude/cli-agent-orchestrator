@@ -61,6 +61,18 @@ logger = logging.getLogger(__name__)
 # Environment variable to enable/disable working_directory parameter
 ENABLE_WORKING_DIRECTORY = os.getenv("CAO_ENABLE_WORKING_DIRECTORY", "false").lower() == "true"
 
+def _enforce_child_profile_policy(agent_profile: str) -> None:
+    """Reject child profiles outside the optional per-supervisor allowlist."""
+    raw = os.getenv("CAO_ALLOWED_CHILD_PROFILES", "").strip()
+    if not raw:
+        return
+    allowed = {item.strip() for item in raw.split(",") if item.strip()}
+    if agent_profile not in allowed:
+        allowed_text = ", ".join(sorted(allowed))
+        raise ValueError(
+            f"Child agent profile '{agent_profile}' is not allowed by this supervisor. "
+            f"Allowed profiles: {allowed_text}"
+        )
 MAX_USER_PROMPT_ANSWER_LENGTH = 4000
 
 
