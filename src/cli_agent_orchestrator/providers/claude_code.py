@@ -396,6 +396,15 @@ class ClaudeCodeProvider(BaseProvider):
         if self._resume_session_id:
             command_parts.extend(["--resume", self._resume_session_id])
 
+        # Load additive MCP config files without forcing strict mode. This is
+        # useful for long-lived supervisors that need one runtime-specific MCP
+        # surface (for example a messaging reply tool) while preserving Claude's
+        # normal user/project MCP discovery.
+        claude_mcp_files = getattr(profile, "claudeMcpConfigFiles", None) if profile else None
+        if claude_mcp_files:
+            for mcp_path in claude_mcp_files:
+                command_parts.extend(["--mcp-config", self._translate_path(str(mcp_path), profile)])
+
         # Route based on profile state
         native = getattr(profile, "native_agent", None) if profile else None
         if profile is not None and isinstance(native, str) and native:
