@@ -1257,7 +1257,11 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
         terminals = (
             db.query(TerminalModel)
             .filter(TerminalModel.tmux_session == tmux_session)
-            .order_by(TerminalModel.last_active.desc(), TerminalModel.id.desc())
+            .order_by(
+                TerminalModel.caller_id.is_not(None),
+                TerminalModel.last_active.desc(),
+                TerminalModel.id.desc(),
+            )
             .all()
         )
         return [

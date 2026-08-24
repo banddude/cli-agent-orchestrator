@@ -225,6 +225,8 @@ class TestTerminalOperations:
         assert len(result) == 1
         assert result[0]["id"] == "test123"
         mock_filtered.order_by.assert_called_once()
+        order_args = mock_filtered.order_by.call_args.args
+        assert "caller_id IS NOT NULL" in str(order_args[0])
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_list_pending_receiver_ids_by_provider(self, mock_session_class):
