@@ -215,7 +215,8 @@ class TestTerminalOperations:
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()
-        mock_query.filter.return_value.all.return_value = [mock_terminal]
+        mock_filtered = mock_query.filter.return_value
+        mock_filtered.order_by.return_value.all.return_value = [mock_terminal]
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
@@ -223,6 +224,7 @@ class TestTerminalOperations:
 
         assert len(result) == 1
         assert result[0]["id"] == "test123"
+        mock_filtered.order_by.assert_called_once()
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_list_pending_receiver_ids_by_provider(self, mock_session_class):

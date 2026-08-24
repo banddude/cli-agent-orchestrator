@@ -1254,7 +1254,12 @@ def list_siblings_by_group_prefix(
 def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
     """List all terminals in a tmux session."""
     with SessionLocal() as db:
-        terminals = db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).all()
+        terminals = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.tmux_session == tmux_session)
+            .order_by(TerminalModel.last_active.desc(), TerminalModel.id.desc())
+            .all()
+        )
         return [
             {
                 "id": t.id,
