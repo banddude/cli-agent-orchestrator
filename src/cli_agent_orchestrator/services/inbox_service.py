@@ -5,6 +5,7 @@ Consumer: terminal.{id}.status
 
 import asyncio
 import logging
+import threading
 from itertools import groupby
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
@@ -34,6 +35,18 @@ logger = logging.getLogger(__name__)
 class InboxService:
     """Delivers one pending message per terminal per IDLE cycle."""
 
+    def __init__(self) -> None:
+        # Multiple API requests can enqueue messages for the same terminal while
+        # Claude is already processing. Their durable DB inserts should return
+        # immediately, but tmux paste/submit itself must remain serialized per
+        # terminal or concurrent bracketed pastes can interleave.
+        self._delivery_locks_guard = threading.Lock()
+        self._delivery_locks: dict[str, threading.Lock] = {}
+
+    def _delivery_lock(self, terminal_id: str) -> threading.Lock:
+        with self._delivery_locks_guard:
+            return self._delivery_locks.setdefault(terminal_id, threading.Lock())
+
     async def run(self, registry: PluginRegistry | None = None) -> None:
         queue = bus.subscribe("terminal.*.status")
         logger.info("InboxService started")
@@ -56,6 +69,16 @@ class InboxService:
                 logger.error(f"Error in InboxService: {e}")
 
     def deliver_pending(
+        self,
+        terminal_id: str,
+        num_messages: int = 1,
+        registry: PluginRegistry | None = None,
+    ) -> None:
+        """Serialize tmux injection per terminal while callers enqueue concurrently."""
+        with self._delivery_lock(terminal_id):
+            self._deliver_pending_locked(terminal_id, num_messages=num_messages, registry=registry)
+
+    def _deliver_pending_locked(
         self,
         terminal_id: str,
         num_messages: int = 1,

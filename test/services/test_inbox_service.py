@@ -579,3 +579,9 @@ class TestRun:
                 pass
 
         mock_to_thread.assert_awaited_once_with(svc.deliver_pending, "abc123", registry=None)
+
+class TestPerTerminalDeliverySerialization:
+    def test_same_terminal_uses_one_delivery_lock(self):
+        svc = InboxService()
+        assert svc._delivery_lock("term-1") is svc._delivery_lock("term-1")
+        assert svc._delivery_lock("term-1") is not svc._delivery_lock("term-2")

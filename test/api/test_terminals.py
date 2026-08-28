@@ -691,6 +691,27 @@ class TestCreateInboxMessageEndpoint:
         assert response.status_code == 200
         create.assert_called_once_with("sender1", "abcd1234", ordinary)
 
+    def test_create_inbox_message_schedules_delivery_as_background_work(self, client):
+        mock_msg = MagicMock()
+        mock_msg.id = 9
+        mock_msg.sender_id = "sender1"
+        mock_msg.receiver_id = "abcd1234"
+        mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
+
+        with (
+            patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
+            patch("cli_agent_orchestrator.api.main.inbox_service") as mock_inbox,
+        ):
+            mock_create.return_value = mock_msg
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={"sender_id": "sender1", "message": "hello"},
+            )
+            assert response.status_code == 200
+            # TestClient drains BackgroundTasks before returning; this assertion
+            # proves delivery remains scheduled and is no longer invoked inline.
+            mock_inbox.deliver_pending.assert_called_once_with("abcd1234", registry=ANY)
+
     def test_create_inbox_message_delivery_failure_still_succeeds(self, client):
         """Immediate delivery failure should not fail the API response."""
         mock_msg = MagicMock()

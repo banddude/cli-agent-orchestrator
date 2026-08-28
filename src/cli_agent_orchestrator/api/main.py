@@ -5476,10 +5476,19 @@ def _sanitize_managed_persistent_message(message: str) -> str:
     return _LEGACY_RUNTIME_ADDRESS_SUFFIX.sub("", message)
 
 
+def _deliver_inbox_background(receiver_id: TerminalId, registry: PluginRegistry) -> None:
+    """Best-effort immediate delivery after durable API acceptance."""
+    try:
+        inbox_service.deliver_pending(receiver_id, registry=registry)
+    except Exception as e:
+        logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
+
+
 @app.post("/terminals/{receiver_id}/inbox/messages")
 async def create_inbox_message_endpoint(
     request: Request,
     receiver_id: TerminalId,
+    background_tasks: BackgroundTasks,
     sender_id: str,
     message: str,
     defer_delivery: bool = False,
@@ -5505,10 +5514,16 @@ async def create_inbox_message_endpoint(
     # duplicate user turn into the supervisor TUI. If the waiter dies, the
     # normal reconcile sweep adopts the still-pending row after its grace window.
     if not defer_delivery:
-        try:
-            inbox_service.deliver_pending(receiver_id, registry=get_plugin_registry(request))
-        except Exception as e:
-            logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
+        # Persist first, return the acceptance response immediately, and perform
+        # the blocking tmux paste/submit after the response. This lets a burst of
+        # messages enter the durable inbox at once instead of making each caller
+        # wait for Claude's paste-submit delay before the next message can enqueue.
+        # InboxService serializes actual tmux injection per terminal.
+        background_tasks.add_task(
+            _deliver_inbox_background,
+            receiver_id,
+            get_plugin_registry(request),
+        )
 
     return {
         "success": True,
