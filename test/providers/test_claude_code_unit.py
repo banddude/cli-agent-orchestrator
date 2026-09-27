@@ -547,6 +547,9 @@ class TestClaudeCodeProviderClaudeCommand:
                 provider="claude_code",
                 claudeCommand="/tmp/a;b/glmf",
             )
+
+
+class TestClaudeCodeProviderStatusDetection:
     """Tests for ClaudeCodeProvider status detection."""
 
     def test_get_status_idle_old_prompt(self):
