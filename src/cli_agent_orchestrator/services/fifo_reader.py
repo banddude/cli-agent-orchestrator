@@ -14,6 +14,7 @@ from cli_agent_orchestrator.constants import (
     FIFO_DIR,
     PIPE_LIVENESS_CHECK_INTERVAL_S,
     PIPE_LIVENESS_COLD_START_GRACE_S,
+    PIPE_LIVENESS_FAILURE_LOG_EVERY,
     PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS,
     PIPE_LIVENESS_MAX_REARM_FAILURES,
     PIPE_LIVENESS_STALL_CHECKS,
@@ -136,6 +137,13 @@ class FifoManager:
         # any successful re-arm; once it hits PIPE_LIVENESS_MAX_REARM_FAILURES
         # the terminal is dropped from the watchdog instead of retrying forever.
         self._rearm_failures: Dict[str, int] = {}
+        # Consecutive probe-check failures per terminal (aiva#512): a terminal
+        # whose tmux session is gone fails on EVERY tick, and logging a full
+        # traceback per failure per terminal grew the server log by GBs. The
+        # first failure and every PIPE_LIVENESS_FAILURE_LOG_EVERY-th one log at
+        # ERROR with the traceback; the rest get a one-line DEBUG with the
+        # running count. Reset on the first successful check.
+        self._check_failures: Dict[str, int] = {}
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: Optional[threading.Thread] = None
 
@@ -212,6 +220,7 @@ class FifoManager:
             self._registered_at.pop(terminal_id, None)
             self._ever_delivered.pop(terminal_id, None)
             self._cold_start_attempts.pop(terminal_id, None)
+            self._check_failures.pop(terminal_id, None)
 
         # Deliberately NOT stopping the watchdog thread here even when this was
         # the last enrolled terminal: doing it under a "now idle" check raced
@@ -411,8 +420,23 @@ class FifoManager:
             for terminal_id in terminal_ids:
                 try:
                     self._check_pipe_liveness(terminal_id)
-                except Exception:
-                    logger.exception("pipe-pane liveness check failed for terminal %s", terminal_id)
+                    self._check_failures.pop(terminal_id, None)
+                except Exception as e:
+                    count = self._check_failures.get(terminal_id, 0) + 1
+                    self._check_failures[terminal_id] = count
+                    if count == 1 or count % PIPE_LIVENESS_FAILURE_LOG_EVERY == 0:
+                        logger.exception(
+                            "pipe-pane liveness check failed for terminal %s (failure %d)",
+                            terminal_id,
+                            count,
+                        )
+                    else:
+                        logger.debug(
+                            "pipe-pane liveness check failed for terminal %s (failure %d): %s",
+                            terminal_id,
+                            count,
+                            e,
+                        )
 
     def _check_pipe_liveness(self, terminal_id: str) -> None:
         """One liveness check for a terminal: re-arm a stalled pipe-pane forwarder.
@@ -521,6 +545,7 @@ class FifoManager:
                     self._registered_at.pop(terminal_id, None)
                     self._ever_delivered.pop(terminal_id, None)
                     self._cold_start_attempts.pop(terminal_id, None)
+                    self._check_failures.pop(terminal_id, None)
                 else:
                     self._cold_start_attempts[terminal_id] = attempts
                     # Reset the grace-period clock so the NEXT evaluation is
@@ -664,6 +689,7 @@ class FifoManager:
                     self._registered_at.pop(terminal_id, None)
                     self._ever_delivered.pop(terminal_id, None)
                     self._cold_start_attempts.pop(terminal_id, None)
+                    self._check_failures.pop(terminal_id, None)
             if give_up:
                 # Not a silent retry-forever: a re-arm that keeps failing
                 # (e.g. the tmux pane is gone) previously re-struck and

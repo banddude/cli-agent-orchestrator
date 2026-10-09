@@ -126,6 +126,26 @@ LOG_DIR = CAO_HOME_DIR / "logs"
 TERMINAL_LOG_DIR = LOG_DIR / "terminal"  # Per-terminal log files for pipe-pane output
 TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 
+# Server log rotation (banddude/aiva#512): the per-start cao_<timestamp>.log file
+# grew to 2.1 GB on a long-lived server because nothing ever rotated it. The
+# active file keeps its timestamped name (existing tooling globs cao_*.log);
+# the handler additionally rolls on size and gzips every rotated file, keeping
+# at most SERVER_LOG_BACKUP_COUNT archives.
+SERVER_LOG_MAX_BYTES = _env_int("CAO_SERVER_LOG_MAX_BYTES", 100 * 1024 * 1024)
+SERVER_LOG_BACKUP_COUNT = _env_int("CAO_SERVER_LOG_BACKUP_COUNT", 14)
+
+# Terminal log maintenance (banddude/aiva#512): per-terminal logs are append-only
+# and are never read in normal operation, so idle ones are gzipped in place
+# (lossless; gunzip to restore) and archives are deleted after the retention
+# window. Compression only ever touches files idle for
+# TERMINAL_LOG_COMPRESS_AFTER_DAYS full days — a terminal actively streaming
+# output has a fresh mtime and is never archived mid-flight.
+TERMINAL_LOG_COMPRESS_AFTER_DAYS = _env_int("CAO_TERMINAL_LOG_COMPRESS_AFTER_DAYS", 3)
+TERMINAL_LOG_RETENTION_DAYS = _env_int("CAO_TERMINAL_LOG_RETENTION_DAYS", 30)
+# How often the maintenance pass runs (seconds). Default 6h; the pass itself is
+# cheap (one directory listing, a handful of gzip/deletes).
+TERMINAL_LOG_MAINTENANCE_INTERVAL_S = _env_int("CAO_TERMINAL_LOG_MAINTENANCE_INTERVAL_S", 6 * 3600)
+
 # FIFO directory for event-driven terminal output streaming
 FIFO_DIR = CAO_HOME_DIR / "fifos"  # Named pipes for tmux pipe-pane streaming
 FIFO_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -209,6 +229,13 @@ PIPE_LIVENESS_COLD_START_GRACE_S = _env_float("CAO_PIPE_LIVENESS_COLD_START_GRAC
 # After this many attempts, give up loudly and drop the terminal from the
 # watchdog, exactly like the rearm()-exception path already does.
 PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS = _env_int("CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS", 5)
+# banddude/aiva#512: a terminal whose tmux session is gone fails its probe on
+# every watchdog tick (default every 4s), and the first implementation logged a
+# full exception traceback per failure per terminal — that alone grew the server
+# log by GBs. The first failure and every Nth consecutive failure log at ERROR
+# with the traceback; the ones in between log one DEBUG line with the running
+# count. The counter resets on the first successful check.
+PIPE_LIVENESS_FAILURE_LOG_EVERY = _env_int("CAO_PIPE_LIVENESS_FAILURE_LOG_EVERY", 900)
 
 # pyte-rendered status detection. When enabled, the StatusMonitor feeds each
 # terminal's output through a pyte terminal emulator and runs detection against

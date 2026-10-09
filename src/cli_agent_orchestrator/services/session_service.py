@@ -148,6 +148,14 @@ def get_session(session_name: str) -> Dict:
             terminal["status"] = status_monitor.get_status(terminal["id"]).value
         return {"session": session_data, "terminals": terminals}
 
+    except ValueError as e:
+        # A polled session that is simply gone maps to a 404 upstream (api/main
+        # raises HTTPException 404 from this same ValueError). Supervisors poll
+        # dead sessions on a timer, so this is a per-request outcome, not an
+        # error to log at ERROR (aiva#512: thousands of repeats grew the server
+        # log by GBs).
+        logger.debug(f"Session not found: {session_name}: {e}")
+        raise
     except Exception as e:
         logger.error(f"Failed to get session {session_name}: {e}")
         raise

@@ -1,5 +1,6 @@
 """Tests for the FIFO reader manager."""
 
+import logging
 import os
 import threading
 import time
@@ -1002,3 +1003,126 @@ class TestConcurrencyRaces:
             "exactly the kind of unhandled RuntimeError that would kill it"
         )
         assert not watchdog.is_alive(), "watchdog thread must exit cleanly once stopped"
+
+
+class TestWatchdogFailureLogRateLimit:
+    """aiva#512: a terminal whose tmux session is gone fails its probe on every
+    watchdog tick, and logging a full exception traceback per failure per
+    terminal grew the server log by GBs. The first failure and every Nth one
+    log at ERROR with the traceback; the in-between failures get a single DEBUG
+    line with the running count. A successful check resets the counter."""
+
+    def _manager(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
+        return FifoManager()
+
+    def _run_loop_iterations(self, manager, iterations, monkeypatch, interval=0.005):
+        """Run the real _watchdog_loop on a thread for ~``iterations`` ticks."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_CHECK_INTERVAL_S", interval)
+        manager._watchdog_stop.clear()
+        watchdog = threading.Thread(target=manager._watchdog_loop, daemon=True)
+        watchdog.start()
+        time.sleep(interval * iterations + 0.05)
+        manager._watchdog_stop.set()
+        watchdog.join(timeout=2.0)
+        assert not watchdog.is_alive()
+
+    def test_first_failure_logs_error_then_debug(self, tmp_path, monkeypatch, caplog):
+        manager = self._manager(tmp_path, monkeypatch)
+        calls = {"n": 0}
+
+        def probe() -> str:
+            calls["n"] += 1
+            raise ValueError("Session 'cao-gone' not found")
+
+        manager._pane_probe["term-gone"] = probe
+        manager._rearm["term-gone"] = lambda: None
+
+        with caplog.at_level(logging.DEBUG, logger="cli_agent_orchestrator.services.fifo_reader"):
+            self._run_loop_iterations(manager, iterations=5, monkeypatch=monkeypatch)
+
+        error_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.ERROR and "term-gone" in r.getMessage()
+        ]
+        debug_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.DEBUG and "term-gone" in r.getMessage()
+        ]
+        assert (
+            len(error_records) == 1
+        ), f"exactly the FIRST failure logs at ERROR, got {len(error_records)}"
+        assert "(failure 1)" in error_records[0].getMessage()
+        assert debug_records, "repeat failures must be visible at DEBUG with the count"
+        assert any("(failure 2)" in r.getMessage() for r in debug_records)
+        assert manager._check_failures.get("term-gone", 0) >= 2
+
+    def test_nth_failure_logs_error_again(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_FAILURE_LOG_EVERY", 3)
+        manager = self._manager(tmp_path, monkeypatch)
+        manager._pane_probe["term-gone"] = lambda: (_ for _ in ()).throw(
+            ValueError("Session 'cao-gone' not found")
+        )
+        manager._rearm["term-gone"] = lambda: None
+
+        with caplog.at_level(logging.DEBUG, logger="cli_agent_orchestrator.services.fifo_reader"):
+            self._run_loop_iterations(manager, iterations=12, monkeypatch=monkeypatch)
+
+        error_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.ERROR and "term-gone" in r.getMessage()
+        ]
+        failure_numbers = {
+            int(r.getMessage().split("(failure ")[1].split(")")[0]) for r in error_records
+        }
+        assert all(
+            n == 1 or n % 3 == 0 for n in failure_numbers
+        ), f"only the first and every Nth failure may log at ERROR, got {sorted(failure_numbers)}"
+        assert 3 in failure_numbers, "the Nth consecutive failure must log at ERROR again"
+
+    def test_success_resets_the_failure_count(self, tmp_path, monkeypatch):
+        manager = self._manager(tmp_path, monkeypatch)
+        state = {"fail": True}
+
+        def probe() -> str:
+            if state["fail"]:
+                raise ValueError("Session 'cao-gone' not found")
+            return "pane content"
+
+        manager._pane_probe["term-flap"] = probe
+        manager._rearm["term-flap"] = lambda: None
+        manager._check_failures["term-flap"] = 7
+
+        # One failing pass bumps the counter, then the probe recovers and the
+        # next pass must clear it.
+        manager._watchdog_stop.clear()
+        # Drive the per-terminal handling directly via loop iterations:
+        # first let a few failing ticks run, then recover.
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_CHECK_INTERVAL_S", 0.005)
+        watchdog = threading.Thread(target=manager._watchdog_loop, daemon=True)
+        watchdog.start()
+        time.sleep(0.05)
+        state["fail"] = False
+        deadline = time.monotonic() + 2.0
+        while manager._check_failures.get("term-flap", 0) != 0 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        manager._watchdog_stop.set()
+        watchdog.join(timeout=2.0)
+
+        assert manager._check_failures.get("term-flap", 0) == 0, (
+            "a successful check must reset the consecutive-failure counter so a "
+            "later failure logs at ERROR again"
+        )
+
+    def test_unenroll_clears_the_failure_counter(self, tmp_path, monkeypatch):
+        manager = self._manager(tmp_path, monkeypatch)
+        manager._pane_probe["term-x"] = lambda: "c"
+        manager._rearm["term-x"] = lambda: None
+        manager._check_failures["term-x"] = 42
+
+        manager.stop_reader("term-x")
+
+        assert "term-x" not in manager._check_failures
