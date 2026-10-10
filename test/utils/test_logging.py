@@ -240,3 +240,95 @@ class TestSetupLoggingRotation:
             call_kwargs = mock_basic_config.call_args[1]
             handlers = call_kwargs["handlers"]
             assert any(isinstance(h, GzipRotatingFileHandler) for h in handlers)
+
+
+class TestRotationSafety:
+    def test_failed_compression_preserves_original_and_leaves_no_archive(self, tmp_path):
+        from cli_agent_orchestrator.utils.logging import GzipRotatingFileHandler
+
+        source = tmp_path / "cao_test.log"
+        source.write_text("original bytes\n")
+        handler = GzipRotatingFileHandler(str(source), delay=True)
+        try:
+            with patch(
+                "cli_agent_orchestrator.utils.logging.shutil.copyfileobj",
+                side_effect=OSError("disk full"),
+            ):
+                with pytest.raises(OSError, match="disk full"):
+                    handler.doRollover()
+            assert source.read_text() == "original bytes\n"
+            assert sorted(p.name for p in tmp_path.iterdir()) == ["cao_test.log"]
+        finally:
+            handler.close()
+
+    def test_racing_archive_collision_preserves_both_sources(self, tmp_path):
+        import os
+
+        from cli_agent_orchestrator.utils.logging import GzipRotatingFileHandler
+
+        source = tmp_path / "cao_test.log"
+        source.write_text("original bytes\n")
+        handler = GzipRotatingFileHandler(str(source), delay=True)
+        real_link = os.link
+
+        def collision(temporary, destination):
+            Path(destination).write_bytes(b"other archive")
+            real_link(temporary, destination)
+
+        try:
+            with patch("cli_agent_orchestrator.utils.logging.os.link", side_effect=collision):
+                with pytest.raises(FileExistsError):
+                    handler.doRollover()
+            assert source.read_text() == "original bytes\n"
+            assert next(tmp_path.glob("*.gz")).read_bytes() == b"other archive"
+            assert not list(tmp_path.glob("*.tmp"))
+        finally:
+            handler.close()
+
+    def test_retention_ignores_unrelated_files_and_symlinks(self, tmp_path):
+        from cli_agent_orchestrator.utils.logging import GzipRotatingFileHandler
+
+        handler = GzipRotatingFileHandler(str(tmp_path / "cao_test.log"), backupCount=1, delay=True)
+        preserved = [
+            "cao_test.log.backup",
+            "cao_test.log.unrelated.gz",
+            "cao_test.log.2026-10-01.gz.tmp",
+        ]
+        for name in preserved:
+            (tmp_path / name).write_text("keep")
+        target = tmp_path / "target"
+        target.write_text("keep target")
+        link = tmp_path / "cao_test.log.2026-09-01.gz"
+        link.symlink_to(target)
+        for day in ["01", "02", "03"]:
+            (tmp_path / f"cao_test.log.2026-10-{day}.gz").write_text("owned archive")
+        try:
+            handler._prune_archives()
+            assert all((tmp_path / name).read_text() == "keep" for name in preserved)
+            assert link.is_symlink()
+            assert target.read_text() == "keep target"
+            assert len(list(tmp_path.glob("cao_test.log.2026-10-??.gz"))) == 1
+        finally:
+            handler.close()
+
+    def test_rotation_leaves_old_terminal_writer_and_range_bytes_intact(self, tmp_path):
+        import os
+
+        from cli_agent_orchestrator.utils.logging import GzipRotatingFileHandler
+
+        terminal = tmp_path / "terminal.log"
+        terminal.write_text("before\n")
+        os.utime(terminal, (1, 1))
+        server = tmp_path / "cao_test.log"
+        server.write_text("server log\n")
+        handler = GzipRotatingFileHandler(str(server), delay=True)
+        try:
+            with terminal.open("a") as writer:
+                handler.doRollover()
+                writer.write("after\n")
+                writer.flush()
+                with terminal.open("rb") as reader:
+                    assert reader.read() == b"before\nafter\n"
+            assert not (tmp_path / "terminal.log.gz").exists()
+        finally:
+            handler.close()

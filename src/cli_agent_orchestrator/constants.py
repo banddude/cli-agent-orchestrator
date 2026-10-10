@@ -134,18 +134,6 @@ TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 SERVER_LOG_MAX_BYTES = _env_int("CAO_SERVER_LOG_MAX_BYTES", 100 * 1024 * 1024)
 SERVER_LOG_BACKUP_COUNT = _env_int("CAO_SERVER_LOG_BACKUP_COUNT", 14)
 
-# Terminal log maintenance (banddude/aiva#512): per-terminal logs are append-only
-# and are never read in normal operation, so idle ones are gzipped in place
-# (lossless; gunzip to restore) and archives are deleted after the retention
-# window. Compression only ever touches files idle for
-# TERMINAL_LOG_COMPRESS_AFTER_DAYS full days — a terminal actively streaming
-# output has a fresh mtime and is never archived mid-flight.
-TERMINAL_LOG_COMPRESS_AFTER_DAYS = _env_int("CAO_TERMINAL_LOG_COMPRESS_AFTER_DAYS", 3)
-TERMINAL_LOG_RETENTION_DAYS = _env_int("CAO_TERMINAL_LOG_RETENTION_DAYS", 30)
-# How often the maintenance pass runs (seconds). Default 6h; the pass itself is
-# cheap (one directory listing, a handful of gzip/deletes).
-TERMINAL_LOG_MAINTENANCE_INTERVAL_S = _env_int("CAO_TERMINAL_LOG_MAINTENANCE_INTERVAL_S", 6 * 3600)
-
 # FIFO directory for event-driven terminal output streaming
 FIFO_DIR = CAO_HOME_DIR / "fifos"  # Named pipes for tmux pipe-pane streaming
 FIFO_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)

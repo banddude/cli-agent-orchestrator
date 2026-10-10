@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -111,9 +112,20 @@ class GzipRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
                 while os.path.exists(f"{stem}.{n}{ext}"):
                     n += 1
                 dest = f"{stem}.{n}{ext}"
-            with open(self.baseFilename, "rb") as f_in, gzip.open(dest, "wb") as f_out:
-                shutil.copyfileobj(f_in, f_out, length=1024 * 1024)
-            os.remove(self.baseFilename)
+            # Publish only a complete archive. Compression failure keeps the
+            # source intact and never leaves a partial .gz that retention sees.
+            fd, temporary = tempfile.mkstemp(dir=self.dirname, suffix=".gz.tmp")
+            try:
+                with os.fdopen(fd, "wb") as raw, open(self.baseFilename, "rb") as source:
+                    with gzip.GzipFile(fileobj=raw, mode="wb") as archive:
+                        shutil.copyfileobj(source, archive, length=1024 * 1024)
+                    raw.flush()
+                    os.fsync(raw.fileno())
+                # link is atomic and refuses a racing destination collision.
+                os.link(temporary, dest)
+                os.remove(self.baseFilename)
+            finally:
+                os.remove(temporary)
         if not self.delay:
             self.stream = self._open()
         self.rolloverAt = self.computeRollover(int(time.time()))
@@ -125,7 +137,15 @@ class GzipRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
             return
         base = os.path.basename(self.baseFilename)
         rotated = sorted(
-            (p for p in Path(self.dirname).glob(base + ".*") if p.is_file()),
+            (
+                p
+                for p in Path(self.dirname).glob(base + ".*.gz")
+                if not p.is_symlink()
+                and p.is_file()
+                and re.fullmatch(
+                    re.escape(base) + r"\.\d{4}-\d{2}-\d{2}(?:\.[1-9]\d*)?\.gz", p.name
+                )
+            ),
             key=lambda p: p.stat().st_mtime,
         )
         for path in rotated[:-backup_count] if len(rotated) > backup_count else []:
