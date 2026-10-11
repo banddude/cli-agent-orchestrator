@@ -22,6 +22,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
+    "anyio>=4.14.2",
     "fastapi>=0.104.0",
     # Upper bound: ext_apps/sep2133.advertise_capability monkey-patches a FastMCP
     # internal (create_initialization_options); cap the major to avoid silent
@@ -55,7 +56,8 @@ dependencies = [
     # JWT/JWKS verification for the default-off OAuth 2.1 auth layer (RS256 via
     # JWKS). The [crypto] extra pulls in `cryptography` for RSA signature
     # verification and provides `jwt.PyJWKClient`. See spec task 9.1 research note.
-    "pyjwt[crypto]>=2.8.0",
+    "pyjwt[crypto]>=2.15.0",
+    "urllib3>=2.8.0",
     # Floor on the TRANSITIVE `cryptography` that `pyjwt[crypto]` pulls in. Two HIGH
     # advisories affect the 48.0.1 the lockfile had resolved: GHSA-g6cj-pr64-35w5
     # (CVE-2026-69247, PKCS#7 Bleichenbacher oracle, fixed in 50.0.0) and
