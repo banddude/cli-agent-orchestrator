@@ -232,6 +232,42 @@ class TestGetSession:
         with pytest.raises(Exception, match="Tmux error"):
             get_session("cao-test")
 
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_not_found_logs_debug_not_error(self, mock_get_backend, caplog):
+        """aiva#512: a polled session that is gone maps to a 404 upstream.
+        Supervisors poll dead sessions on a timer, so the service must log the
+        not-found outcome at DEBUG, never at ERROR (that per-request ERROR line
+        repeated thousands of times and grew the server log by GBs)."""
+        import logging
+
+        mock_get_backend.return_value.session_exists.return_value = False
+
+        with caplog.at_level(
+            logging.DEBUG, logger="cli_agent_orchestrator.services.session_service"
+        ):
+            with pytest.raises(ValueError, match="not found"):
+                get_session("cao-nonexistent")
+
+        assert not [
+            r for r in caplog.records if r.levelno >= logging.ERROR
+        ], "a not-found session poll must not log at ERROR"
+
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_unexpected_error_still_logs_error(self, mock_get_backend, caplog):
+        """Non-not-found failures keep their ERROR log (aiva#512 only demoted
+        the expected per-request not-found outcome)."""
+        import logging
+
+        mock_get_backend.return_value.session_exists.side_effect = RuntimeError("tmux blew up")
+
+        with caplog.at_level(
+            logging.DEBUG, logger="cli_agent_orchestrator.services.session_service"
+        ):
+            with pytest.raises(RuntimeError, match="tmux blew up"):
+                get_session("cao-test")
+
+        assert any(r.levelno == logging.ERROR for r in caplog.records)
+
 
 class TestDeleteSession:
     """Tests for delete_session function."""

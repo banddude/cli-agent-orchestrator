@@ -844,7 +844,15 @@ class TmuxClient:
             # Join all lines with newlines to get complete output
             return "\n".join(result.stdout) if result.stdout else ""
         except Exception as e:
-            logger.error(f"Failed to get history from {session_name}:{window_name}: {e}")
+            # "not found" is the expected outcome when the liveness watchdog
+            # probes a terminal whose tmux session is already gone (aiva#512):
+            # it fires every tick per dead terminal, so it logs at DEBUG to
+            # keep it out of the server log's per-request volume. Real lookup
+            # failures still log at ERROR.
+            if isinstance(e, ValueError) and "not found" in str(e):
+                logger.debug(f"Session/window gone for history: {session_name}:{window_name}: {e}")
+            else:
+                logger.error(f"Failed to get history from {session_name}:{window_name}: {e}")
             raise
 
     def list_sessions(self) -> List[Dict[str, str]]:
