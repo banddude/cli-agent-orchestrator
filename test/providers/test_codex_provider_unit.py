@@ -2954,3 +2954,25 @@ class TestCodexProviderBlocksOrchestratedInputWhileWaitingUserAnswer:
         mock_tmux.send_keys.assert_not_called()
         mock_notify.assert_called_once()
         assert mock_notify.call_args.kwargs["delete_worker"] is False
+
+
+@pytest.mark.parametrize("bullet", ["•", "◦"])
+@pytest.mark.parametrize("duration", ["0s", "33s", "1m 00s", "1h 02m 03s"])
+def test_live_progress_marker_variants_are_processing(bullet, duration):
+    provider = CodexProvider("worker", "session", "window", None)
+    provider._initialized = False
+    output = (
+        f"{bullet} Working ({duration} • esc to interrupt)\n"
+        "› Ask Codex to do anything\n"
+        "GPT-6-Sol medium · ~/workspace"
+    )
+    assert provider.supports_direct_status_probe is True
+    assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+
+def test_old_hollow_progress_in_scrollback_does_not_pin_idle_pane():
+    provider = CodexProvider("worker", "session", "window", None)
+    provider._initialized = False
+    output = "◦ Working (33s • esc to interrupt)\n" + "\n".join(["old output"] * 30)
+    output += "\n› Ask Codex to do anything\nGPT-6-Sol medium · ~/workspace"
+    assert provider.get_status(output) == TerminalStatus.IDLE

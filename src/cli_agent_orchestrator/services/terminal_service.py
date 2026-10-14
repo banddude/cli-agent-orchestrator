@@ -835,6 +835,10 @@ async def _confirm_worker_started_or_resubmit(
         ):
             return True
 
+    # The worker may have begun during the last cached-status wait. Do not
+    # authorize teardown without one final fresh visible-pane check.
+    if provider is not None and getattr(provider, "supports_direct_status_probe", False):
+        return await asyncio.to_thread(_worker_is_started_direct, terminal_id, provider)
     return False
 
 

@@ -267,3 +267,53 @@ class TestWorkerIsStartedDirect:
             patch.object(ts, "get_backend") as mock_be,
         ):
             assert ts._worker_is_started_direct("t1", provider) is False
+
+
+@pytest.mark.asyncio
+async def test_last_live_probe_prevents_teardown_after_all_cached_waits():
+    provider = MagicMock(supports_direct_status_probe=True)
+    with (
+        patch.object(ts, "wait_until_status", new=AsyncMock(return_value=False)),
+        patch.object(
+            ts, "_worker_is_started_direct", side_effect=[False, False, False, True]
+        ) as live,
+        patch.object(ts, "_message_visible_in_box", return_value=True),
+        patch.object(ts, "send_special_key") as key,
+        patch.object(ts, "send_input") as send,
+    ):
+        started = await ts._confirm_worker_started_or_resubmit(
+            "worker", "Analyze the logs", None, "owner", None, provider=provider
+        )
+    assert started is True
+    assert live.call_count == 4
+    assert key.call_count == 3
+    send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cached_idle_with_live_codex_processing_never_queues_duplicate_prompt():
+    from cli_agent_orchestrator.providers.codex import CodexProvider
+
+    provider = CodexProvider("worker", "session", "window", None)
+    provider._initialized = False
+    with (
+        patch.object(ts, "wait_until_status", new=AsyncMock(return_value=False)),
+        patch.object(
+            ts,
+            "get_terminal_metadata",
+            return_value={"tmux_session": "session", "tmux_window": "window"},
+        ),
+        patch.object(ts, "get_backend") as backend,
+        patch.object(ts, "send_special_key") as key,
+        patch.object(ts, "send_input") as send,
+    ):
+        backend.return_value.get_history.return_value = (
+            "◦ Working (33s • esc to interrupt)\n"
+            "› Ask Codex to do anything\n"
+            "GPT-6-Sol medium · ~/workspace"
+        )
+        assert await ts._confirm_worker_started_or_resubmit(
+            "worker", "Analyze the logs", None, "owner", None, provider=provider
+        )
+    key.assert_not_called()
+    send.assert_not_called()
