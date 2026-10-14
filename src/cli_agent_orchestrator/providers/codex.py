@@ -78,7 +78,7 @@ TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])
 # Appears inline with --no-alt-screen when the agent is actively processing.
 # Must be checked before COMPLETED to avoid false positives (the • matches
 # ASSISTANT_PREFIX_PATTERN and the TUI footer › matches idle prompt).
-TUI_PROGRESS_PATTERN = r"•[^\n]*\((?:(?:\d+h\s+)?\d+m\s+)?\d+s\s*•\s*esc to interrupt\)"
+TUI_PROGRESS_PATTERN = r"[•◦][^\n]*\((?:(?:\d+h\s+)?\d+m\s+)?\d+s\s*•\s*esc to interrupt\)"
 
 # Workspace trust/approval prompt shown when Codex opens a new directory.
 # Two known variants:
@@ -397,6 +397,8 @@ class CodexProvider(BaseProvider):
     # through StatusMonitor's pyte-composited viewport so get_status() sees only
     # the live frame rather than stale redraw history.
     supports_screen_detection = True
+    # Startup confirmation must not trust a stale event-driven IDLE cache.
+    supports_direct_status_probe = True
 
     def __init__(
         self,

@@ -188,6 +188,9 @@ jobs:
         run: npm run coverage:ratchet
 
   cao-mcp-apps-e2e:
+    # Real browsers require explicit owner approval. Pure/component mocks above
+    # remain in required CI; skipped rendering is not claimed as acceptance.
+    if: vars.CAO_REAL_BROWSER_TESTS_OWNER_APPROVED == 'true'
     name: CAO MCP Apps E2E (Playwright)
     runs-on: ubuntu-latest
 
@@ -254,6 +257,7 @@ jobs:
         continue-on-error: true
 
   ag-ui-demo:
+    if: vars.CAO_REAL_BROWSER_TESTS_OWNER_APPROVED == 'true'
     name: AG-UI demo (shift-left recording)
     runs-on: ubuntu-latest
     steps:
@@ -306,6 +310,7 @@ jobs:
         continue-on-error: true
 
   ag-ui-construct-demos:
+    if: vars.CAO_REAL_BROWSER_TESTS_OWNER_APPROVED == 'true'
     name: AG-UI construct demos (shift-left recordings)
     runs-on: ubuntu-latest
     steps:
