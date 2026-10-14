@@ -28,9 +28,9 @@ class TestMessageVisibleInBox:
             assert ts._message_visible_in_box("t1", "go") is False
             mock_out.assert_not_called()
 
-    def test_false_when_output_fetch_raises(self):
+    def test_none_when_output_fetch_raises(self):
         with patch.object(ts, "get_output", side_effect=Exception("boom")):
-            assert ts._message_visible_in_box("t1", "Analyze the logs") is False
+            assert ts._message_visible_in_box("t1", "Analyze the logs") is None
 
     def test_match_survives_wrapping_and_whitespace(self):
         # Rendered box wraps the text across lines / pads with spaces.
@@ -189,19 +189,19 @@ class TestConfirmWorkerStartedOrResubmit:
 class TestWorkerIsStartedDirect:
     """Unit tests for the capture-pane direct status probe."""
 
-    def test_returns_false_when_metadata_is_none(self):
+    def test_returns_none_when_metadata_is_none(self):
         with patch.object(ts, "get_terminal_metadata", return_value=None):
-            assert ts._worker_is_started_direct("t1", MagicMock()) is False
+            assert ts._worker_is_started_direct("t1", MagicMock()) is None
 
-    def test_returns_false_when_session_key_missing(self):
+    def test_returns_none_when_session_key_missing(self):
         with patch.object(ts, "get_terminal_metadata", return_value={"tmux_window": "w1"}):
-            assert ts._worker_is_started_direct("t1", MagicMock()) is False
+            assert ts._worker_is_started_direct("t1", MagicMock()) is None
 
-    def test_returns_false_when_window_key_missing(self):
+    def test_returns_none_when_window_key_missing(self):
         with patch.object(ts, "get_terminal_metadata", return_value={"tmux_session": "s1"}):
-            assert ts._worker_is_started_direct("t1", MagicMock()) is False
+            assert ts._worker_is_started_direct("t1", MagicMock()) is None
 
-    def test_returns_false_when_get_history_raises(self):
+    def test_returns_none_when_get_history_raises(self):
         with (
             patch.object(
                 ts,
@@ -214,9 +214,9 @@ class TestWorkerIsStartedDirect:
             patch.object(ts, "get_backend") as mock_be,
         ):
             mock_be.return_value.get_history.side_effect = Exception("capture failed")
-            assert ts._worker_is_started_direct("t1", MagicMock()) is False
+            assert ts._worker_is_started_direct("t1", MagicMock()) is None
 
-    def test_returns_false_when_get_status_raises(self):
+    def test_returns_none_when_get_status_raises(self):
         provider = MagicMock()
         provider.get_status.side_effect = Exception("parse failure")
         with (
@@ -230,7 +230,7 @@ class TestWorkerIsStartedDirect:
             ),
             patch.object(ts, "get_backend") as mock_be,
         ):
-            assert ts._worker_is_started_direct("t1", provider) is False
+            assert ts._worker_is_started_direct("t1", provider) is None
 
     def test_returns_true_when_status_is_processing(self):
         from cli_agent_orchestrator.models.terminal import TerminalStatus
