@@ -708,7 +708,7 @@ _DEFERRED_STARTED_STATUSES = {
 }
 
 
-def _worker_is_started_direct(terminal_id: str, provider) -> bool:
+def _worker_is_started_direct(terminal_id: str, provider) -> Optional[bool]:
     """Direct visible-screen status check bypassing the event-driven status cache.
 
     The deferred-init retry loop polls ``status_monitor.get_status()`` which
@@ -721,6 +721,8 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
     (not the 8 KB rolling buffer, which is too small to reliably hold the
     footer) and calls ``provider.get_status()`` directly, catching the real
     state so the retry loop doesn't re-deliver into a working terminal.
+    True proves a started state, False proves IDLE, and None means the
+    observation is unavailable. Only confirmed IDLE permits recovery actions.
 
     Only providers that set ``supports_direct_status_probe = True`` should
     be passed to this function; the ``get_status()`` contract for other
@@ -731,25 +733,27 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
-            return False
+            return None
         session_name = metadata.get("tmux_session")
         window_name = metadata.get("tmux_window")
         if not session_name or not window_name:
-            return False
+            return None
         output = get_backend().get_history(session_name, window_name, tail_lines=200)
         status = provider.get_status(output)
     except Exception:
         logger.debug(
-            "Direct status probe for %s failed (falling through to cached path)",
+            "Direct status probe for %s unavailable; preserving worker",
             terminal_id,
             exc_info=True,
         )
-        return False
-    return status in _DEFERRED_STARTED_STATUSES
+        return None
+    if status in _DEFERRED_STARTED_STATUSES:
+        return True
+    return False if status == TerminalStatus.IDLE else None
 
 
-def _message_visible_in_box(terminal_id: str, message: str) -> bool:
-    """True when the delivered message is still sitting in the input box.
+def _message_visible_in_box(terminal_id: str, message: str) -> Optional[bool]:
+    """True if visible, False if absent, None if observation is unavailable.
 
     Decides the resubmit action: if our text is there the paste landed and only
     the Enter was dropped (send a bare Enter); if it is absent the paste itself
@@ -765,9 +769,9 @@ def _message_visible_in_box(terminal_id: str, message: str) -> bool:
         return False
     try:
         rendered = get_output(terminal_id)
+        return probe in re.sub(r"[^a-z0-9]", "", rendered.lower())
     except Exception:
-        return False
-    return probe in re.sub(r"[^a-z0-9]", "", rendered.lower())
+        return None
 
 
 async def _confirm_worker_started_or_resubmit(
@@ -777,12 +781,13 @@ async def _confirm_worker_started_or_resubmit(
     sender_id: Optional[str],
     orchestration_type: Optional[OrchestrationType],
     provider=None,
-) -> bool:
+) -> Optional[bool]:
     """Confirm a deferred-init worker began processing; re-submit if not.
 
-    Returns True once the terminal reaches a started status, False if it is
-    still stuck at IDLE after all resubmit attempts. Blocking tmux/DB I/O runs
-    off the loop via to_thread so concurrent deferred inits aren't frozen.
+    Returns True for a started status, False for confirmed idle exhaustion,
+    or None when a required live observation is unavailable. None authorizes
+    neither resubmission nor teardown. Blocking tmux/DB I/O runs off the loop
+    via to_thread so concurrent deferred inits aren't frozen.
     """
     if await wait_until_status(
         terminal_id,
@@ -801,10 +806,14 @@ async def _confirm_worker_started_or_resubmit(
         # footer appearing between pyte detection edges). Only providers that
         # opt in via ``supports_direct_status_probe = True`` take this path.
         if provider is not None and getattr(provider, "supports_direct_status_probe", False):
-            if await asyncio.to_thread(_worker_is_started_direct, terminal_id, provider):
-                return True
+            observed = await asyncio.to_thread(_worker_is_started_direct, terminal_id, provider)
+            if observed is not False:
+                return observed
 
-        if await asyncio.to_thread(_message_visible_in_box, terminal_id, message):
+        message_visible = await asyncio.to_thread(_message_visible_in_box, terminal_id, message)
+        if message_visible is None:
+            return None  # Capture failure is not evidence that the paste was dropped.
+        if message_visible:
             logger.warning(
                 "Deferred assign to %s unsubmitted (Enter swallowed); "
                 "re-submitting via Enter (attempt %d)",
@@ -920,6 +929,22 @@ def _schedule_deferred_init(
                     effective_orchestration_type,
                     provider=provider_instance,
                 )
+                if started is None:
+                    logger.warning(
+                        "Deferred init for %s: live startup observation unavailable; "
+                        "preserving worker without resubmission or teardown.",
+                        terminal_id,
+                    )
+                    await asyncio.to_thread(
+                        _notify_caller_of_deferred_failure,
+                        terminal_id,
+                        f"Worker {terminal_id} startup observation is unavailable. "
+                        "The worker is preserved; task acceptance and completion are "
+                        "unverified. Inspect the worker before any manual retry.",
+                        registry,
+                        delete_worker=False,
+                    )
+                    return
                 if not started:
                     logger.error(
                         "Deferred init for %s: worker never started after "
