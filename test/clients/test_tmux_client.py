@@ -84,7 +84,7 @@ class TestCreateSession:
         Default detached pane is 80x24. When the user attaches, tmux resizes
         the pane to their real terminal size and kiro-cli 2.1.x fails to
         repaint (blank screen, input silently dropped). Creating the pane at
-        220x50 makes the attach-time resize a no-op or shrink, which kiro
+        220x60 makes the attach-time resize a no-op or shrink, which kiro
         handles correctly.
         """
         mock_window = MagicMock()
@@ -97,7 +97,32 @@ class TestCreateSession:
 
         kwargs = tmux.server.new_session.call_args.kwargs
         assert kwargs.get("x") == 220
-        assert kwargs.get("y") == 50
+        assert kwargs.get("y") == 60
+        mock_window.resize.assert_called_once_with(width=220, height=60)
+
+    def test_tiny_window_is_resized_before_returning_to_provider_startup(self, tmux, tmp_path):
+        window = MagicMock()
+        window.width, window.height = "2", "1"
+        events = []
+        window.resize.side_effect = lambda **kw: events.append(("resize", kw))
+        type(window).name = property(lambda self: events.append(("name", None)) or "worker")
+        session = MagicMock()
+        session.windows = [window]
+        tmux.server.new_session.return_value = session
+
+        assert tmux.create_session("ses", "worker", "tid", str(tmp_path)) == "worker"
+        assert events == [("resize", {"width": 220, "height": 60}), ("name", None)]
+
+    def test_resize_failure_rolls_back_only_the_new_session(self, tmux, tmp_path):
+        window = MagicMock()
+        window.resize.side_effect = RuntimeError("resize unavailable")
+        session = MagicMock()
+        session.windows = [window]
+        tmux.server.new_session.return_value = session
+
+        with pytest.raises(RuntimeError, match="resize unavailable"):
+            tmux.create_session("ses", "worker", "tid", str(tmp_path))
+        session.kill.assert_called_once_with()
 
 
 class TestCreateSessionEnvironmentFiltering:
@@ -760,3 +785,32 @@ class TestPaneIsBracketedPasteIncompatible:
         unresolvable pane command -- see send_keys' own docstring."""
         with patch.object(tmux, "get_pane_current_command", return_value=None):
             assert tmux._pane_is_bracketed_paste_incompatible("ses", "win") is False
+
+
+def test_real_tmux_tiny_new_window_is_sized_before_provider_startup(tmp_path, monkeypatch):
+    """Exercise the actual resize and pane geometry on a private tmux server."""
+    import shutil
+    import libtmux
+    from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+    if not shutil.which("tmux"):
+        pytest.skip("tmux executable unavailable")
+    server = libtmux.Server(socket_path=str(tmp_path / "tmux.sock"), config_file="/dev/null")
+    client = TmuxClient()
+    client.server = server
+    new_session = server.new_session
+
+    def tiny_session(**kwargs):
+        session = new_session(**kwargs)
+        session.windows[0].resize(width=2, height=1)
+        return session
+
+    monkeypatch.setattr(server, "new_session", tiny_session)
+    try:
+        assert client.create_session("sizing", "worker", "fixture", str(tmp_path)) == "worker"
+        window = server.sessions.get(session_name="sizing").windows[0]
+        pane = window.active_pane
+        assert (int(window.width), int(window.height)) == (220, 60)
+        assert int(pane.width) >= 80 and int(pane.height) >= 24
+    finally:
+        server.cmd("kill-server")

@@ -387,7 +387,7 @@ class TmuxClient:
             self._merge_extra_env(environment, extra_env)
             environment["CAO_TERMINAL_ID"] = terminal_id
 
-            # Explicit 220x50 pane size avoids the default 80x24 that tmux
+            # Explicit 220x60 pane size avoids the default 80x24 that tmux
             # assigns to detached sessions. kiro-cli 2.1.x's TUI v2 fails to
             # repaint after a SIGWINCH from the attach-time resize (80x24 →
             # user's real terminal): the screen goes blank and input is
@@ -402,7 +402,7 @@ class TmuxClient:
                     detach=True,
                     environment=environment,
                     x=220,
-                    y=50,
+                    y=60,
                 )
             except ValueError as e:
                 # new_session() lists the server to build its Session object,
@@ -429,10 +429,17 @@ class TmuxClient:
                 f"Created tmux session: {session_name} with window: {window_name} in directory: {working_directory}"
             )
             try:
-                window_name_result = self._read_listing(
+                window = self._read_listing(
                     f"list-windows for new session '{session_name}'",
-                    lambda: session.windows[0].name,
+                    lambda: session.windows[0],
                 )
+                # Enforce the size on the actual window before any provider
+                # starts. A 2x1 window was observed on the spawn path; creation-time
+                # dimensions alone must not be the startup guarantee.
+                # This is scoped to the newly created window, never global
+                # tmux options or an existing agent's terminal.
+                window.resize(width=220, height=60)
+                window_name_result = window.name
                 if window_name_result is None:
                     raise ValueError(f"Window name is None for session {session_name}")
             except TmuxLookupError:
