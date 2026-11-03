@@ -88,49 +88,76 @@ async def wait_for_shell(
     stable_duration: float = 2.0,
     polling_interval: float = 0.3,
 ) -> bool:
-    """Wait for shell to be ready by checking if the output buffer is stable and non-empty.
+    """Wait for shell readiness from the backend's live pane capture.
 
-    For pipe-pane backends (tmux) this reads the StatusMonitor's in-memory
-    buffer, populated by the FIFO reader → event bus → StatusMonitor pipeline.
-    Returns True when the buffer is non-empty and has not changed for
-    *stable_duration* seconds.
+    Readiness is grounded in the terminal backend's own pane read
+    (``backend.get_history`` for the provider-resolved session/window), not
+    in the StatusMonitor's in-memory rolling buffer. StatusMonitor and
+    LogWriter each subscribe to ``terminal.*.output`` through the shared
+    event bus with independent bounded queues, and a full queue silently
+    drops new events, so the buffer can stay empty (or hold stale content)
+    while the pane itself has already rendered a stable prompt. The 2026-11-03
+    startup failure showed exactly that: the prompt event was dropped, the
+    buffer never showed readiness, and every provider initialize() timed out
+    and tore the terminal down. A backend pane read bypasses that pipeline
+    entirely, so it cannot drop the prompt.
 
-    Event-inbox backends (herdr) deliberately skip that pipeline — their
-    pipe_pane is a no-op and create_terminal() never starts a FIFO reader for
-    them (the FIFO setup is gated on ``not supports_event_inbox()``), so the
-    StatusMonitor buffer would stay empty forever and this would always time
-    out. For those backends we read pane output directly via
-    ``backend.get_history()`` instead.
+    Returns True only when the pane capture is non-empty and has not changed
+    for ``stable_duration`` seconds, polled every ``polling_interval`` seconds
+    within the overall ``timeout``. Refusal is fail-closed in every
+    unreadable or unconvinced case:
+
+    - empty or whitespace-only capture: not ready;
+    - capture still changing between polls: not ready;
+    - backend read error (session/window gone, listing parse failure, ...):
+      not ready; an unreadable pane must never look ready;
+    - no provider registered for the terminal (pane coordinates cannot be
+      resolved): not ready.
+
+    There is no synthetic ready and no stale-buffer success: the decision
+    uses only the live pane read, so a stale StatusMonitor buffer can never
+    grant readiness and a broken backend read can never be papered over.
+
+    Event-inbox backends (herdr) already read pane output this way; their
+    behavior is unchanged. Pipe-pane backends (tmux) previously read the
+    StatusMonitor buffer instead, which is what this repair removes. Both
+    backend families share the same predicate, stability window, polling
+    cadence, and overall timeout.
 
     This does NOT use provider-specific status detection because the provider
     is already registered before initialize() runs, and provider patterns
     don't match raw shell output.
     """
     from cli_agent_orchestrator.backends.registry import get_backend
-    from cli_agent_orchestrator.services.status_monitor import status_monitor
 
     backend = get_backend()
-    window = _resolve_window(terminal_id) if backend.supports_event_inbox() else None
-    if backend.supports_event_inbox() and window is None:
+    try:
+        window = _resolve_window(terminal_id)
+    except Exception as e:
         logger.warning(
-            f"wait_for_shell [{terminal_id}]: event-inbox backend but no provider "
-            f"registered; falling back to (empty) StatusMonitor buffer"
+            f"wait_for_shell [{terminal_id}]: provider lookup failed ({e}); "
+            f"backend pane coordinates unresolved"
+        )
+        window = None
+
+    if window is None:
+        logger.warning(
+            f"wait_for_shell [{terminal_id}]: no provider registered; refusing "
+            f"readiness from backend pane state (no buffer fallback)"
         )
 
-    if window is not None:
+        def read_pane() -> str:
+            return ""
+
+    else:
         session_name, window_name = window
 
-        def read_buffer() -> str:
+        def read_pane() -> str:
             try:
                 return backend.get_history(session_name, window_name, strip_escapes=True)
             except Exception as e:
-                logger.debug(f"wait_for_shell [{terminal_id}]: backend history read failed: {e}")
+                logger.debug(f"wait_for_shell [{terminal_id}]: backend pane read failed: {e}")
                 return ""
-
-    else:
-
-        def read_buffer() -> str:
-            return status_monitor.get_buffer(terminal_id)
 
     logger.info(f"Waiting for shell to be ready for terminal {terminal_id}...")
 
@@ -139,7 +166,7 @@ async def wait_for_shell(
     last_change = time.time()
 
     while time.time() < deadline:
-        buf = read_buffer()
+        buf = read_pane()
 
         if buf != previous_buffer:
             previous_buffer = buf
@@ -148,7 +175,7 @@ async def wait_for_shell(
         stable_elapsed = time.time() - last_change
 
         if buf.strip() and stable_elapsed >= stable_duration:
-            logger.info(f"Shell ready for {terminal_id} (buffer stable, {len(buf)} bytes)")
+            logger.info(f"Shell ready for {terminal_id} (pane stable, {len(buf)} bytes)")
             return True
 
         await asyncio.sleep(polling_interval)
