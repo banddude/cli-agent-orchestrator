@@ -434,6 +434,7 @@ class TestWaitForShellEventInbox:
 
         assert result is False
 
+
 class TestWaitUntilStatus:
     """Tests for wait_until_status function."""
 
