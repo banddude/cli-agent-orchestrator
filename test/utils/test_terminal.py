@@ -138,38 +138,105 @@ class TestValidateTmuxName:
 
 
 class TestWaitForShell:
-    """Tests for wait_for_shell function."""
+    """Tests for wait_for_shell function.
+
+    Since the 2026-11-03 repair, readiness on every backend family is decided
+    from the live backend pane read (provider-resolved session/window), never
+    from the StatusMonitor buffer: StatusMonitor and LogWriter each subscribe
+    to terminal.*.output through the shared event bus with independent bounded
+    queues. Output drops and a readiness timeout despite a rendered prompt
+    were observed, though the exact dropped bytes and subscriber were
+    not identified. Empty, changing, and unreadable panes must all refuse.
+    """
 
     @pytest.fixture(autouse=True)
     def _use_pipe_pane_backend(self):
         backend = MagicMock()
         backend.supports_event_inbox.return_value = False
-        with patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend):
+        backend.get_history.return_value = "prompt $"
+        provider = MagicMock()
+        provider.session_name = "sess"
+        provider.window_name = "win"
+        with (
+            patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+            patch("cli_agent_orchestrator.providers.manager.provider_manager") as mock_pm,
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor") as mock_monitor,
+        ):
+            mock_pm.get_provider.return_value = provider
+            self.backend = backend
+            self.mock_pm = mock_pm
+            self.mock_monitor = mock_monitor
             yield
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
-    async def test_wait_for_shell_success(self, mock_monitor):
-        """Test successful shell wait - buffer is non-empty and stable."""
-        mock_monitor.get_buffer.return_value = "prompt $"
-
+    async def test_wait_for_shell_success(self):
+        """Stable non-empty pane capture reports readiness."""
         result = await wait_for_shell(
             "test-terminal", timeout=2.0, stable_duration=0.3, polling_interval=0.1
         )
 
         assert result is True
+        self.backend.get_history.assert_called_with("sess", "win", strip_escapes=True)
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
-    async def test_wait_for_shell_timeout(self, mock_monitor):
-        """Test shell wait timeout - buffer keeps changing."""
+    async def test_slow_pane_read_respects_deadline_and_keeps_event_loop_responsive(self):
+        """A slow synchronous backend capture is bounded by the original wait
+        deadline and runs off the event loop."""
+        import time
+
+        def slow_capture(session_name, window_name, strip_escapes):
+            time.sleep(0.15)
+            return "prompt $"
+
+        self.backend.get_history.side_effect = slow_capture
+        pulses = 0
+        keep_pulsing = True
+
+        async def pulse_event_loop():
+            nonlocal pulses
+            while keep_pulsing:
+                pulses += 1
+                await asyncio.sleep(0.005)
+
+        pulse_task = asyncio.create_task(pulse_event_loop())
+        try:
+            result = await wait_for_shell(
+                "test-terminal", timeout=0.04, stable_duration=0.0, polling_interval=0.01
+            )
+        finally:
+            keep_pulsing = False
+            await pulse_task
+
+        assert result is False
+        assert pulses > 0
+
+    @pytest.mark.asyncio
+    async def test_capture_completing_after_deadline_never_grants_readiness(self):
+        """A pane read that returns after the wait budget cannot grant ready."""
+        import time
+
+        def late_capture(session_name, window_name, strip_escapes):
+            time.sleep(0.08)
+            return "prompt $"
+
+        self.backend.get_history.side_effect = late_capture
+
+        result = await wait_for_shell(
+            "test-terminal", timeout=0.03, stable_duration=0.0, polling_interval=0.01
+        )
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_wait_for_shell_timeout(self):
+        """Test shell wait timeout - pane capture keeps changing."""
         call_count = [0]
 
-        def get_buffer_side_effect(terminal_id):
+        def get_history_side_effect(session_name, window_name, strip_escapes):
             call_count[0] += 1
             return f"output {call_count[0]}"
 
-        mock_monitor.get_buffer.side_effect = get_buffer_side_effect
+        self.backend.get_history.side_effect = get_history_side_effect
 
         result = await wait_for_shell(
             "test-terminal", timeout=0.5, stable_duration=0.3, polling_interval=0.1
@@ -178,10 +245,137 @@ class TestWaitForShell:
         assert result is False
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
-    async def test_wait_for_shell_empty_output(self, mock_monitor):
-        """Test shell wait with empty output."""
-        mock_monitor.get_buffer.return_value = ""
+    async def test_wait_for_shell_empty_output(self):
+        """Empty and whitespace-only pane captures must refuse."""
+        self.backend.get_history.return_value = ""
+
+        result = await wait_for_shell(
+            "test-terminal", timeout=0.5, stable_duration=0.3, polling_interval=0.1
+        )
+
+        assert result is False
+
+        self.backend.get_history.return_value = "   \n\t"
+
+        result = await wait_for_shell(
+            "test-terminal", timeout=0.5, stable_duration=0.3, polling_interval=0.1
+        )
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_dropped_prompt_event_still_ready(self):
+        """Model a possible dropped prompt event: the StatusMonitor buffer is
+        empty while a stable prompt is present in the pane. Readiness must be
+        detected from the pane read. The exact historical dropped bytes and
+        subscriber were not identified."""
+        self.mock_monitor.get_buffer.return_value = ""  # prompt event dropped
+        self.backend.get_history.return_value = "user@host:~$ "
+
+        result = await wait_for_shell(
+            "test-terminal", timeout=2.0, stable_duration=0.3, polling_interval=0.1
+        )
+
+        assert result is True
+        # The decision never consulted the (dropped-into) buffer; the read was
+        # targeted at this terminal's pane.
+        self.mock_monitor.get_buffer.assert_not_called()
+        self.backend.get_history.assert_called_with("sess", "win", strip_escapes=True)
+
+    @pytest.mark.asyncio
+    async def test_stale_buffer_never_grants_readiness(self):
+        """No stale-buffer success: a buffer holding prompt-like content must
+        not paper over a pane that reads back empty. The readiness decision
+        never consults the buffer at all."""
+        self.mock_monitor.get_buffer.return_value = "user@host:~$ "  # stale buffer
+        self.backend.get_history.return_value = ""  # live pane: empty
+
+        result = await wait_for_shell(
+            "test-terminal", timeout=0.5, stable_duration=0.3, polling_interval=0.1
+        )
+
+        assert result is False
+        self.mock_monitor.get_buffer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unrelated_terminal_flood_does_not_block_readiness(self):
+        """A flood of output events from unrelated terminals fills the shared
+        event-bus subscriber queues and drops this terminal's prompt event.
+        Readiness must still be detected: the pane read targets only this
+        terminal's session/window and never consults the flooded buffer."""
+        flood_count = [0]
+
+        def flooded_buffer(terminal_id):
+            flood_count[0] += 1
+            return f"unrelated terminal noise {flood_count[0]}"
+
+        self.mock_monitor.get_buffer.side_effect = flooded_buffer
+        # This terminal's pane has been sitting on a stable prompt throughout.
+
+        result = await wait_for_shell(
+            "test-terminal", timeout=2.0, stable_duration=0.3, polling_interval=0.1
+        )
+
+        assert result is True
+        self.mock_monitor.get_buffer.assert_not_called()
+        self.backend.get_history.assert_called_with("sess", "win", strip_escapes=True)
+
+    @pytest.mark.asyncio
+    async def test_persistent_backend_read_error_refuses(self):
+        """Original-failure cleanup preserved: persistent backend read errors
+        must end in a clean False (never an exception, never a synthetic
+        ready), so provider initialize() still raises TimeoutError and the
+        existing teardown (FIFO reader stop, provider cleanup) runs exactly
+        as before."""
+        self.backend.get_history.side_effect = ValueError("Session 'sess' not found")
+
+        result = await wait_for_shell(
+            "test-terminal", timeout=0.5, stable_duration=0.3, polling_interval=0.1
+        )
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_transient_read_error_then_stable_pane_is_ready(self):
+        """A transient backend error refuses that poll (it reads as empty and
+        resets the stability window) but does not poison readiness: once the
+        pane is genuinely readable and stable for stable_duration, readiness
+        is granted on real content."""
+        reads = [RuntimeError("tmux listing churn"), "prompt $", "prompt $", "prompt $"]
+
+        def read_pane(session_name, window_name, strip_escapes):
+            reading = reads.pop(0) if reads else "prompt $"
+            if isinstance(reading, Exception):
+                raise reading
+            return reading
+
+        self.backend.get_history.side_effect = read_pane
+
+        result = await wait_for_shell(
+            "test-terminal", timeout=2.0, stable_duration=0.2, polling_interval=0.1
+        )
+
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_missing_provider_refuses(self):
+        """No provider registered: pane coordinates cannot be resolved, so
+        readiness must refuse instead of falling back to the buffer."""
+        self.mock_pm.get_provider.return_value = None
+
+        result = await wait_for_shell(
+            "test-terminal", timeout=0.5, stable_duration=0.3, polling_interval=0.1
+        )
+
+        assert result is False
+        self.backend.get_history.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_provider_lookup_error_refuses(self):
+        """A provider lookup failure is a refusal, not a crash."""
+        self.mock_pm.get_provider.side_effect = ValueError(
+            "Terminal test-terminal not found in database"
+        )
 
         result = await wait_for_shell(
             "test-terminal", timeout=0.5, stable_duration=0.3, polling_interval=0.1
@@ -239,25 +433,6 @@ class TestWaitForShellEventInbox:
         result = await wait_for_shell("t1", timeout=0.4, stable_duration=0.2, polling_interval=0.1)
 
         assert result is False
-
-    @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.providers.manager.provider_manager")
-    @patch("cli_agent_orchestrator.backends.registry.get_backend")
-    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
-    async def test_tmux_backend_still_uses_status_monitor(
-        self, mock_monitor, mock_get_backend, mock_pm
-    ):
-        # Pipe-pane backend: behavior unchanged — read the StatusMonitor buffer,
-        # never touch backend.get_history.
-        mock_monitor.get_buffer.return_value = "prompt $"
-        backend = self._backend(history="ignored", event_inbox=False)
-        mock_get_backend.return_value = backend
-
-        result = await wait_for_shell("t1", timeout=2.0, stable_duration=0.3, polling_interval=0.1)
-
-        assert result is True
-        backend.get_history.assert_not_called()
-        mock_pm.get_provider.assert_not_called()
 
 
 class TestWaitUntilStatus:
