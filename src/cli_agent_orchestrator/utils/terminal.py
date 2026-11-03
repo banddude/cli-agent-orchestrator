@@ -97,10 +97,10 @@ async def wait_for_shell(
     event bus with independent bounded queues, and a full queue silently
     drops new events, so the buffer can stay empty (or hold stale content)
     while the pane itself has already rendered a stable prompt. The 2026-11-03
-    startup failure showed exactly that: the prompt event was dropped, the
-    buffer never showed readiness, and every provider initialize() timed out
-    and tore the terminal down. A backend pane read bypasses that pipeline
-    entirely, so it cannot drop the prompt.
+    startup failure showed output drops during the readiness window and a
+    terminal log without a rendered prompt. A full subscriber queue could
+    explain a missing prompt event, but the exact dropped bytes and subscriber
+    were not identified. A backend pane read bypasses that pipeline entirely.
 
     Returns True only when the pane capture is non-empty and has not changed
     for ``stable_duration`` seconds, polled every ``polling_interval`` seconds
@@ -161,24 +161,36 @@ async def wait_for_shell(
 
     logger.info(f"Waiting for shell to be ready for terminal {terminal_id}...")
 
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     previous_buffer = ""
-    last_change = time.time()
+    last_change = time.monotonic()
 
-    while time.time() < deadline:
-        buf = read_pane()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            buf = await asyncio.wait_for(asyncio.to_thread(read_pane), timeout=remaining)
+        except asyncio.TimeoutError:
+            break
+
+        # A pane read can complete at the timeout boundary. Do not let a
+        # capture that returned after the original deadline grant readiness.
+        now = time.monotonic()
+        if now >= deadline:
+            break
 
         if buf != previous_buffer:
             previous_buffer = buf
-            last_change = time.time()
+            last_change = now
 
-        stable_elapsed = time.time() - last_change
+        stable_elapsed = now - last_change
 
         if buf.strip() and stable_elapsed >= stable_duration:
             logger.info(f"Shell ready for {terminal_id} (pane stable, {len(buf)} bytes)")
             return True
 
-        await asyncio.sleep(polling_interval)
+        await asyncio.sleep(min(polling_interval, max(0.0, deadline - time.monotonic())))
 
     logger.warning(f"Timeout waiting for shell to be ready for {terminal_id}")
     return False

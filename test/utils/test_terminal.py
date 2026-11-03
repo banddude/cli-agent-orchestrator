@@ -144,9 +144,9 @@ class TestWaitForShell:
     from the live backend pane read (provider-resolved session/window), never
     from the StatusMonitor buffer: StatusMonitor and LogWriter each subscribe
     to terminal.*.output through the shared event bus with independent bounded
-    queues, and a full queue silently drops the prompt event, so the buffer
-    can sit empty or stale while the pane has already rendered a stable
-    prompt. Empty, changing, and unreadable panes must all refuse.
+    queues. Output drops and the missing rendered prompt were observed during
+    the startup failure, though the exact dropped bytes and subscriber were
+    not identified. Empty, changing, and unreadable panes must all refuse.
     """
 
     @pytest.fixture(autouse=True)
@@ -177,6 +177,55 @@ class TestWaitForShell:
 
         assert result is True
         self.backend.get_history.assert_called_with("sess", "win", strip_escapes=True)
+
+    @pytest.mark.asyncio
+    async def test_slow_pane_read_respects_deadline_and_keeps_event_loop_responsive(self):
+        """A slow synchronous backend capture is bounded by the original wait
+        deadline and runs off the event loop."""
+        import time
+
+        def slow_capture(session_name, window_name, strip_escapes):
+            time.sleep(0.15)
+            return "prompt $"
+
+        self.backend.get_history.side_effect = slow_capture
+        pulses = 0
+        keep_pulsing = True
+
+        async def pulse_event_loop():
+            nonlocal pulses
+            while keep_pulsing:
+                pulses += 1
+                await asyncio.sleep(0.005)
+
+        pulse_task = asyncio.create_task(pulse_event_loop())
+        try:
+            result = await wait_for_shell(
+                "test-terminal", timeout=0.04, stable_duration=0.0, polling_interval=0.01
+            )
+        finally:
+            keep_pulsing = False
+            await pulse_task
+
+        assert result is False
+        assert pulses > 0
+
+    @pytest.mark.asyncio
+    async def test_capture_completing_after_deadline_never_grants_readiness(self):
+        """A pane read that returns after the wait budget cannot grant ready."""
+        import time
+
+        def late_capture(session_name, window_name, strip_escapes):
+            time.sleep(0.08)
+            return "prompt $"
+
+        self.backend.get_history.side_effect = late_capture
+
+        result = await wait_for_shell(
+            "test-terminal", timeout=0.03, stable_duration=0.0, polling_interval=0.01
+        )
+
+        assert result is False
 
     @pytest.mark.asyncio
     async def test_wait_for_shell_timeout(self):
@@ -216,10 +265,10 @@ class TestWaitForShell:
 
     @pytest.mark.asyncio
     async def test_dropped_prompt_event_still_ready(self):
-        """Regression (2026-11-03 startup failure): the event bus drops the
-        prompt output event when a subscriber queue is full, so the
-        StatusMonitor buffer stays empty. The tmux pane itself already shows a
-        stable prompt, and readiness must be detected from that pane read."""
+        """Model a possible dropped prompt event: the StatusMonitor buffer is
+        empty while a stable prompt is present in the pane. Readiness must be
+        detected from the pane read. The exact historical dropped bytes and
+        subscriber were not identified."""
         self.mock_monitor.get_buffer.return_value = ""  # prompt event dropped
         self.backend.get_history.return_value = "user@host:~$ "
 
