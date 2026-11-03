@@ -98,7 +98,7 @@ async def wait_for_shell(
     drops new events, so the buffer can stay empty (or hold stale content)
     while the pane itself has already rendered a stable prompt. The 2026-11-03
     startup failure showed output drops during the readiness window and a
-    terminal log without a rendered prompt. A full subscriber queue could
+    rendered prompt in the terminal log despite the readiness timeout. A full queue could
     explain a missing prompt event, but the exact dropped bytes and subscriber
     were not identified. A backend pane read bypasses that pipeline entirely.
 

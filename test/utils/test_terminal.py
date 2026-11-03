@@ -144,8 +144,8 @@ class TestWaitForShell:
     from the live backend pane read (provider-resolved session/window), never
     from the StatusMonitor buffer: StatusMonitor and LogWriter each subscribe
     to terminal.*.output through the shared event bus with independent bounded
-    queues. Output drops and the missing rendered prompt were observed during
-    the startup failure, though the exact dropped bytes and subscriber were
+    queues. Output drops and a readiness timeout despite a rendered prompt
+    were observed, though the exact dropped bytes and subscriber were
     not identified. Empty, changing, and unreadable panes must all refuse.
     """
 
@@ -433,7 +433,6 @@ class TestWaitForShellEventInbox:
         result = await wait_for_shell("t1", timeout=0.4, stable_duration=0.2, polling_interval=0.1)
 
         assert result is False
-
 
 class TestWaitUntilStatus:
     """Tests for wait_until_status function."""
