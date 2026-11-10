@@ -2994,6 +2994,7 @@ class TestCodexDroppedStartupReady:
         provider.shell_baseline = "bash"
         backend = MagicMock()
         backend.supports_event_inbox.return_value = False
+        backend.get_native_status.return_value = None
         backend.get_pane_current_command.return_value = "codex"
         backend.get_history.return_value = self.SCREEN
         return provider, backend
