@@ -845,7 +845,9 @@ class CodexProvider(BaseProvider):
             # Use the existing detector/latch path, so first-task confirmation
             # cannot inherit the stale PROCESSING value as proof of execution.
             status_monitor._apply_detection(self.terminal_id, TerminalStatus.IDLE)
-            logger.info("Codex init-ready recovered from fresh visible pane for %s", self.terminal_id)
+            logger.info(
+                "Codex init-ready recovered from fresh visible pane for %s", self.terminal_id
+            )
             return True
         except Exception:
             # A failed/ambiguous pane lookup must never authorize task delivery.

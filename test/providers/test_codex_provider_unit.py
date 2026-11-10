@@ -3003,9 +3003,12 @@ class TestCodexDroppedStartupReady:
 
     def test_fresh_viewport_recovers_stale_processing_before_first_send(self):
         provider, backend = self.provider_and_backend()
-        with patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend), patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor._apply_detection"
-        ) as apply_detection:
+        with (
+            patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.status_monitor._apply_detection"
+            ) as apply_detection,
+        ):
             assert provider._recover_startup_idle_status() is True
         backend.get_history.assert_called_once_with(
             "test-session", "window-0", tail_lines=0, strip_escapes=True
@@ -3022,20 +3025,36 @@ class TestCodexDroppedStartupReady:
             assert provider._recover_startup_idle_status() is False
         backend.get_history.assert_not_called()
 
-    @pytest.mark.parametrize("screen", [
-        "", "OpenAI Codex (v0.166.0)\nloading", 
-        "OpenAI Codex (v0.166.0)\n› this is an unsent task\nGPT-6.1-Sol · ~/repo",
-        "OpenAI Codex (v0.166.0)\n• Working (1s • esc to interrupt)\n› Ask Codex to do anything\nGPT-6.1-Sol · ~/repo",
-        "OpenAI Codex (v0.166.0)\nCommand Approval Required\n› Ask Codex to do anything\nGPT-6.1-Sol · ~/repo",
-        "OpenAI Codex (v0.166.0)\nError: unavailable\n› Ask Codex to do anything\nGPT-6.1-Sol · ~/repo",
-        "› Ask Codex to do anything\nGPT-6.1-Sol · ~/repo",
-    ])
+    @pytest.mark.parametrize(
+        "screen",
+        [
+            "",
+            "OpenAI Codex (v0.166.0)\nloading",
+            "OpenAI Codex (v0.166.0)\n› this is an unsent task\nGPT-6.1-Sol · ~/repo",
+            (
+                "OpenAI Codex (v0.166.0)\n• Working (1s • esc to interrupt)\n"
+                "› Ask Codex to do anything\nGPT-6.1-Sol · ~/repo"
+            ),
+            (
+                "OpenAI Codex (v0.166.0)\nCommand Approval Required\n"
+                "› Ask Codex to do anything\nGPT-6.1-Sol · ~/repo"
+            ),
+            (
+                "OpenAI Codex (v0.166.0)\nError: unavailable\n"
+                "› Ask Codex to do anything\nGPT-6.1-Sol · ~/repo"
+            ),
+            "› Ask Codex to do anything\nGPT-6.1-Sol · ~/repo",
+        ],
+    )
     def test_incomplete_draft_busy_dialog_error_or_no_banner_refuses(self, screen):
         provider, backend = self.provider_and_backend()
         backend.get_history.return_value = screen
-        with patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend), patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor._apply_detection"
-        ) as apply_detection:
+        with (
+            patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.status_monitor._apply_detection"
+            ) as apply_detection,
+        ):
             assert provider._recover_startup_idle_status() is False
         apply_detection.assert_not_called()
 
@@ -3055,13 +3074,22 @@ class TestCodexDroppedStartupReady:
     @pytest.mark.asyncio
     async def test_initialize_recovers_after_cached_timeout_without_replaying_input(self):
         provider, backend = self.provider_and_backend()
-        with patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend), patch(
-            "cli_agent_orchestrator.providers.codex.wait_for_shell", new=AsyncMock(return_value=True)
-        ), patch("cli_agent_orchestrator.providers.codex.wait_until_status", new=AsyncMock(return_value=False)), patch.object(
-            provider, "_handle_trust_prompt", new=AsyncMock()
-        ), patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new=AsyncMock()), patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor._apply_detection"
-        ) as apply_detection:
+        with (
+            patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend),
+            patch(
+                "cli_agent_orchestrator.providers.codex.wait_for_shell",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.codex.wait_until_status",
+                new=AsyncMock(return_value=False),
+            ),
+            patch.object(provider, "_handle_trust_prompt", new=AsyncMock()),
+            patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new=AsyncMock()),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.status_monitor._apply_detection"
+            ) as apply_detection,
+        ):
             backend.get_pane_current_command.side_effect = ["bash", "codex"]
             assert await provider.initialize() is True
         assert provider._initialized is True
