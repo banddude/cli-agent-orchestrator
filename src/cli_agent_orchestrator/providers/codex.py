@@ -854,6 +854,10 @@ class CodexProvider(BaseProvider):
             # Use the existing detector/latch path, so first-task confirmation
             # cannot inherit the stale PROCESSING value as proof of execution.
             status_monitor._apply_detection(self.terminal_id, TerminalStatus.IDLE)
+            # The latch can refuse COMPLETED -> IDLE after a concurrent ready
+            # transition. Do not claim recovery unless IDLE was really retained.
+            if status_monitor.get_status(self.terminal_id) != TerminalStatus.IDLE:
+                return False
             logger.info(
                 "Codex init-ready recovered from fresh visible pane for %s", self.terminal_id
             )
