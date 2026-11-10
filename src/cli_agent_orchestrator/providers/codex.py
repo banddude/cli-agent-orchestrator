@@ -824,8 +824,14 @@ class CodexProvider(BaseProvider):
             backend = get_backend()
             if backend.supports_event_inbox():
                 return False
+            # An unknown baseline disables the normal process-exit guard too.
+            # Never use old welcome text to recover a pane of unknown identity.
+            if self.shell_baseline not in {"bash", "zsh", "sh", "dash", "fish", "ksh", "tcsh"}:
+                return False
             command = backend.get_pane_current_command(self.session_name, self.window_name)
-            if not isinstance(command, str) or not command or command == self.shell_baseline:
+            # Only the actual native Codex foreground is qualified here. Node
+            # wrappers/other executables retain the normal status/timeout path.
+            if command not in {"codex", "codex.exe"}:
                 return False
             # tail_lines=0 captures the whole visible pane without scrollback.
             screen = backend.get_history(
@@ -841,6 +847,9 @@ class CodexProvider(BaseProvider):
             if not _has_startup_idle_composer(clean):
                 return False
             if self.get_status(clean) != TerminalStatus.IDLE:
+                return False
+            # Refuse an exit or foreground change during the viewport read.
+            if backend.get_pane_current_command(self.session_name, self.window_name) != command:
                 return False
             # Use the existing detector/latch path, so first-task confirmation
             # cannot inherit the stale PROCESSING value as proof of execution.
