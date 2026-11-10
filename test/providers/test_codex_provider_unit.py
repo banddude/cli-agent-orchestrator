@@ -2976,3 +2976,96 @@ def test_old_hollow_progress_in_scrollback_does_not_pin_idle_pane():
     output = "◦ Working (33s • esc to interrupt)\n" + "\n".join(["old output"] * 30)
     output += "\n› Ask Codex to do anything\nGPT-6-Sol medium · ~/workspace"
     assert provider.get_status(output) == TerminalStatus.IDLE
+
+
+class TestCodexDroppedStartupReady:
+    """Regressions for the four Nov10 never-delivered startup failures."""
+
+    SCREEN = (
+        "  >_ OpenAI Codex (v0.166.0)\n"
+        "     ~/mikeshaffer\n"
+        "  permissions: YOLO mode\n\n"
+        "› Ask Codex to do anything\n\n"
+        "  GPT-6.1-Sol high · ~/mikeshaffer     ⚠ 2 · f2\n"
+    )
+
+    def provider_and_backend(self):
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+        provider.shell_baseline = "bash"
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        backend.get_pane_current_command.return_value = "codex"
+        backend.get_history.return_value = self.SCREEN
+        return provider, backend
+
+    def test_current_codex_placeholder_is_idle_composer(self):
+        assert _has_startup_idle_composer(self.SCREEN)
+
+    def test_fresh_viewport_recovers_stale_processing_before_first_send(self):
+        provider, backend = self.provider_and_backend()
+        with patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend), patch(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor._apply_detection"
+        ) as apply_detection:
+            assert provider._recover_startup_idle_status() is True
+        backend.get_history.assert_called_once_with(
+            "test-session", "window-0", tail_lines=0, strip_escapes=True
+        )
+        apply_detection.assert_called_once_with("test1234", TerminalStatus.IDLE)
+        backend.send_keys.assert_not_called()
+        backend.send_special_key.assert_not_called()
+
+    @pytest.mark.parametrize("command", [None, "", "bash"])
+    def test_shell_or_unknown_foreground_never_recovers(self, command):
+        provider, backend = self.provider_and_backend()
+        backend.get_pane_current_command.return_value = command
+        with patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend):
+            assert provider._recover_startup_idle_status() is False
+        backend.get_history.assert_not_called()
+
+    @pytest.mark.parametrize("screen", [
+        "", "OpenAI Codex (v0.166.0)\nloading", 
+        "OpenAI Codex (v0.166.0)\n› this is an unsent task\nGPT-6.1-Sol · ~/repo",
+        "OpenAI Codex (v0.166.0)\n• Working (1s • esc to interrupt)\n› Ask Codex to do anything\nGPT-6.1-Sol · ~/repo",
+        "OpenAI Codex (v0.166.0)\nCommand Approval Required\n› Ask Codex to do anything\nGPT-6.1-Sol · ~/repo",
+        "OpenAI Codex (v0.166.0)\nError: unavailable\n› Ask Codex to do anything\nGPT-6.1-Sol · ~/repo",
+        "› Ask Codex to do anything\nGPT-6.1-Sol · ~/repo",
+    ])
+    def test_incomplete_draft_busy_dialog_error_or_no_banner_refuses(self, screen):
+        provider, backend = self.provider_and_backend()
+        backend.get_history.return_value = screen
+        with patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend), patch(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor._apply_detection"
+        ) as apply_detection:
+            assert provider._recover_startup_idle_status() is False
+        apply_detection.assert_not_called()
+
+    def test_native_backend_is_not_overridden(self):
+        provider, backend = self.provider_and_backend()
+        backend.supports_event_inbox.return_value = True
+        with patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend):
+            assert provider._recover_startup_idle_status() is False
+        backend.get_history.assert_not_called()
+
+    def test_lookup_failure_keeps_timeout(self):
+        provider, backend = self.provider_and_backend()
+        backend.get_history.side_effect = RuntimeError("lookup failed")
+        with patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend):
+            assert provider._recover_startup_idle_status() is False
+
+    @pytest.mark.asyncio
+    async def test_initialize_recovers_after_cached_timeout_without_replaying_input(self):
+        provider, backend = self.provider_and_backend()
+        with patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend), patch(
+            "cli_agent_orchestrator.providers.codex.wait_for_shell", new=AsyncMock(return_value=True)
+        ), patch("cli_agent_orchestrator.providers.codex.wait_until_status", new=AsyncMock(return_value=False)), patch.object(
+            provider, "_handle_trust_prompt", new=AsyncMock()
+        ), patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new=AsyncMock()), patch(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor._apply_detection"
+        ) as apply_detection:
+            backend.get_pane_current_command.side_effect = ["bash", "codex"]
+            assert await provider.initialize() is True
+        assert provider._initialized is True
+        # Warm-up and CLI launch only. Task delivery remains terminal_service-owned.
+        assert backend.send_keys.call_count == 2
+        backend.send_special_key.assert_not_called()
+        apply_detection.assert_called_once_with("test1234", TerminalStatus.IDLE)
