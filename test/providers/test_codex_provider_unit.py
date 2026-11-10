@@ -3017,7 +3017,7 @@ class TestCodexDroppedStartupReady:
         backend.send_keys.assert_not_called()
         backend.send_special_key.assert_not_called()
 
-    @pytest.mark.parametrize("command", [None, "", "bash"])
+    @pytest.mark.parametrize("command", [None, "", "bash", "zsh", "sh", "node", "unknown"])
     def test_shell_or_unknown_foreground_never_recovers(self, command):
         provider, backend = self.provider_and_backend()
         backend.get_pane_current_command.return_value = command
@@ -3090,10 +3090,59 @@ class TestCodexDroppedStartupReady:
                 "cli_agent_orchestrator.services.status_monitor.status_monitor._apply_detection"
             ) as apply_detection,
         ):
-            backend.get_pane_current_command.side_effect = ["bash", "codex"]
+            backend.get_pane_current_command.side_effect = ["bash", "codex", "codex"]
             assert await provider.initialize() is True
         assert provider._initialized is True
         # Warm-up and CLI launch only. Task delivery remains terminal_service-owned.
         assert backend.send_keys.call_count == 2
         backend.send_special_key.assert_not_called()
         apply_detection.assert_called_once_with("test1234", TerminalStatus.IDLE)
+
+    @pytest.mark.parametrize("baseline", [None, "", "unknown", "codex"])
+    @pytest.mark.parametrize("command", [None, "bash", "zsh", "codex", "unknown"])
+    def test_unknown_baseline_never_authorizes_fresh_ready(self, baseline, command):
+        provider, backend = self.provider_and_backend()
+        provider.shell_baseline = baseline
+        backend.get_pane_current_command.return_value = command
+        with patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend):
+            assert provider._recover_startup_idle_status() is False
+        backend.get_history.assert_not_called()
+
+    def test_foreground_exit_during_capture_refuses_stale_codex_screen(self):
+        provider, backend = self.provider_and_backend()
+        backend.get_pane_current_command.side_effect = ["codex", "bash"]
+        with (
+            patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.status_monitor._apply_detection"
+            ) as apply_detection,
+        ):
+            assert provider._recover_startup_idle_status() is False
+        apply_detection.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("baseline", [None, ""])
+    @pytest.mark.parametrize("foreground", ["bash", "zsh", "codex", None])
+    async def test_actual_initialize_keeps_timeout_with_unknown_shell(self, baseline, foreground):
+        provider, backend = self.provider_and_backend()
+        with (
+            patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend),
+            patch(
+                "cli_agent_orchestrator.providers.codex.wait_for_shell",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.codex.wait_until_status",
+                new=AsyncMock(return_value=False),
+            ),
+            patch.object(provider, "_handle_trust_prompt", new=AsyncMock()),
+            patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new=AsyncMock()),
+        ):
+            backend.get_pane_current_command.side_effect = [baseline, foreground]
+            with pytest.raises(TimeoutError, match="Codex initialization timed out"):
+                await provider.initialize()
+        assert provider._initialized is False
+        backend.get_history.assert_not_called()
+        # Only warm-up/CLI launch. A failed readiness check never pastes a task.
+        assert backend.send_keys.call_count == 2
+        backend.send_special_key.assert_not_called()
