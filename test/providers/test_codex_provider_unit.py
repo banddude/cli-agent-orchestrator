@@ -3008,6 +3008,10 @@ class TestCodexDroppedStartupReady:
             patch(
                 "cli_agent_orchestrator.services.status_monitor.status_monitor._apply_detection"
             ) as apply_detection,
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
+                return_value=TerminalStatus.IDLE,
+            ),
         ):
             assert provider._recover_startup_idle_status() is True
         backend.get_history.assert_called_once_with(
@@ -3089,6 +3093,10 @@ class TestCodexDroppedStartupReady:
             patch(
                 "cli_agent_orchestrator.services.status_monitor.status_monitor._apply_detection"
             ) as apply_detection,
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
+                return_value=TerminalStatus.IDLE,
+            ),
         ):
             backend.get_pane_current_command.side_effect = ["bash", "codex", "codex"]
             assert await provider.initialize() is True
@@ -3146,3 +3154,83 @@ class TestCodexDroppedStartupReady:
         # Only warm-up/CLI launch. A failed readiness check never pastes a task.
         assert backend.send_keys.call_count == 2
         backend.send_special_key.assert_not_called()
+
+    @pytest.mark.parametrize("use_screen", [False, True])
+    def test_real_monitor_reconciles_ready_and_requires_next_work(self, use_screen):
+        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+        provider, backend = self.provider_and_backend()
+        monitor = StatusMonitor()
+        terminal = provider.terminal_id
+        busy = (
+            "\x1b[2J\x1b[HOpenAI Codex (v0.166.0)\r\n"
+            "• Working (1s • esc to interrupt)\r\n"
+            "› Ask Codex to do anything\r\nGPT-6.1-Sol · ~/repo\r\n"
+        )
+
+        def detect_raw(terminal_id, buffer):
+            monitor._apply_detection(terminal_id, monitor._detect_status(terminal_id, buffer))
+
+        def detect_screen(terminal_id, actual_provider):
+            monitor._apply_detection(
+                terminal_id, monitor._detect_screen(terminal_id, actual_provider)
+            )
+
+        with (
+            patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend),
+            patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor", monitor),
+            patch("cli_agent_orchestrator.services.status_monitor.bus.publish"),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
+                return_value=provider,
+            ),
+            patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", use_screen),
+            patch.object(monitor, "_schedule_raw_detection", side_effect=detect_raw),
+            patch.object(monitor, "_schedule_screen_detection", side_effect=detect_screen),
+        ):
+            # Only scheduling is made synchronous. Real raw/pyte parsing,
+            # detector, locks, latch and input arm/buffer-clear all execute.
+            monitor._process_chunk(terminal, busy)
+            assert monitor.get_status(terminal) == TerminalStatus.PROCESSING
+            monitor.notify_input_sent(terminal)
+            assert provider._recover_startup_idle_status() is True
+            assert monitor.get_status(terminal) == TerminalStatus.IDLE
+            assert monitor._allow_processing_revert[terminal] is False
+
+            # A delayed pre-input busy frame cannot undo recovered readiness.
+            monitor._process_chunk(terminal, busy)
+            assert monitor.get_status(terminal) == TerminalStatus.IDLE
+
+            # Match send_input's actual arm/clear order, without sending keys.
+            monitor.notify_input_sent(terminal)
+            monitor.clear_rolling_buffer(terminal)
+            assert monitor.get_status(terminal) == TerminalStatus.IDLE
+            assert monitor._allow_processing_revert[terminal] is True
+
+            # Even a ready-to-ready late frame must preserve the next-input arm.
+            monitor._apply_detection(terminal, TerminalStatus.IDLE)
+            assert monitor._allow_processing_revert[terminal] is True
+            monitor._process_chunk(terminal, busy)
+            assert monitor.get_status(terminal) == TerminalStatus.PROCESSING
+            assert monitor._allow_processing_revert[terminal] is False
+        backend.send_keys.assert_not_called()
+        backend.send_special_key.assert_not_called()
+
+    def test_real_monitor_late_completed_latch_refuses_recovery(self):
+        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+        provider, backend = self.provider_and_backend()
+        monitor = StatusMonitor()
+        terminal = provider.terminal_id
+        with (
+            patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend),
+            patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor", monitor),
+            patch("cli_agent_orchestrator.services.status_monitor.bus.publish"),
+        ):
+            monitor._apply_detection(terminal, TerminalStatus.PROCESSING)
+            monitor._apply_detection(terminal, TerminalStatus.COMPLETED)
+            assert provider._recover_startup_idle_status() is False
+            assert monitor.get_status(terminal) == TerminalStatus.COMPLETED
+        backend.send_keys.assert_not_called()
