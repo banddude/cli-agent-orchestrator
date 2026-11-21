@@ -132,6 +132,7 @@ STARTUP_BLOCKING_INPUT_PATTERN = (
 )
 STARTUP_IDLE_PLACEHOLDER_PATTERN = (
     rf"^\s*{IDLE_PROMPT_PATTERN}[^\S\n]+(?:"
+    r"Ask Codex to do anything|"
     r"Explain this codebase|"
     r"Summarize recent commits|"
     r"Implement \{feature\}|"
@@ -800,10 +801,71 @@ class CodexProvider(BaseProvider):
             timeout=float(get_server_settings()["provider_init_timeout"]),
             polling_interval=1.0,
         ):
-            raise TimeoutError("Codex initialization timed out after 60 seconds")
+            # A full output-event queue can leave the monitor at PROCESSING even
+            # after the TUI has settled. Before teardown, read the actual current
+            # viewport and require the startup-only composer, not a cached state
+            # or OSC working signal emitted during Codex's own initialization.
+            if not await asyncio.to_thread(self._recover_startup_idle_status):
+                raise TimeoutError(f"Codex initialization timed out after {init_timeout} seconds")
 
         self._initialized = True
         return True
+
+    def _recover_startup_idle_status(self) -> bool:
+        """Recover one dropped init-ready transition from a fresh tmux viewport.
+
+        This is only called before first task delivery, after the normal init
+        wait failed. No input, dialog answer, retry or process lifecycle occurs.
+        Native event-inbox backends retain their own authoritative status path.
+        """
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        try:
+            backend = get_backend()
+            if backend.supports_event_inbox():
+                return False
+            # An unknown baseline disables the normal process-exit guard too.
+            # Never use old welcome text to recover a pane of unknown identity.
+            if self.shell_baseline not in {"bash", "zsh", "sh", "dash", "fish", "ksh", "tcsh"}:
+                return False
+            command = backend.get_pane_current_command(self.session_name, self.window_name)
+            # Only the actual native Codex foreground is qualified here. Node
+            # wrappers/other executables retain the normal status/timeout path.
+            if command not in {"codex", "codex.exe"}:
+                return False
+            # tail_lines=0 captures the whole visible pane without scrollback.
+            screen = backend.get_history(
+                self.session_name, self.window_name, tail_lines=0, strip_escapes=True
+            )
+            if not isinstance(screen, str) or not screen:
+                return False
+            clean = strip_terminal_escapes(screen)
+            if not re.search(CODEX_WELCOME_PATTERN, clean):
+                return False
+            if re.search(ERROR_PATTERN, clean, re.IGNORECASE | re.MULTILINE):
+                return False
+            if not _has_startup_idle_composer(clean):
+                return False
+            if self.get_status(clean) != TerminalStatus.IDLE:
+                return False
+            # Refuse an exit or foreground change during the viewport read.
+            if backend.get_pane_current_command(self.session_name, self.window_name) != command:
+                return False
+            # Use the existing detector/latch path, so first-task confirmation
+            # cannot inherit the stale PROCESSING value as proof of execution.
+            status_monitor._apply_detection(self.terminal_id, TerminalStatus.IDLE)
+            # The latch can refuse COMPLETED -> IDLE after a concurrent ready
+            # transition. Do not claim recovery unless IDLE was really retained.
+            if status_monitor.get_status(self.terminal_id) != TerminalStatus.IDLE:
+                return False
+            logger.info(
+                "Codex init-ready recovered from fresh visible pane for %s", self.terminal_id
+            )
+            return True
+        except Exception:
+            # A failed/ambiguous pane lookup must never authorize task delivery.
+            logger.warning("Unable to verify fresh Codex startup pane for %s", self.terminal_id)
+            return False
 
     def get_status(self, output: str) -> TerminalStatus:
         # Native status (herdr): trust the backend's agent state when available;

@@ -2976,3 +2976,262 @@ def test_old_hollow_progress_in_scrollback_does_not_pin_idle_pane():
     output = "◦ Working (33s • esc to interrupt)\n" + "\n".join(["old output"] * 30)
     output += "\n› Ask Codex to do anything\nGPT-6-Sol medium · ~/workspace"
     assert provider.get_status(output) == TerminalStatus.IDLE
+
+
+class TestCodexDroppedStartupReady:
+    """Regressions for the four Nov10 never-delivered startup failures."""
+
+    SCREEN = (
+        "  >_ OpenAI Codex (v0.166.0)\n"
+        "     ~/mikeshaffer\n"
+        "  permissions: YOLO mode\n\n"
+        "› Ask Codex to do anything\n\n"
+        "  GPT-6.1-Sol high · ~/mikeshaffer     ⚠ 2 · f2\n"
+    )
+
+    def provider_and_backend(self):
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+        provider.shell_baseline = "bash"
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        backend.get_native_status.return_value = None
+        backend.get_pane_current_command.return_value = "codex"
+        backend.get_history.return_value = self.SCREEN
+        return provider, backend
+
+    def test_current_codex_placeholder_is_idle_composer(self):
+        assert _has_startup_idle_composer(self.SCREEN)
+
+    def test_fresh_viewport_recovers_stale_processing_before_first_send(self):
+        provider, backend = self.provider_and_backend()
+        with (
+            patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.status_monitor._apply_detection"
+            ) as apply_detection,
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
+                return_value=TerminalStatus.IDLE,
+            ),
+        ):
+            assert provider._recover_startup_idle_status() is True
+        backend.get_history.assert_called_once_with(
+            "test-session", "window-0", tail_lines=0, strip_escapes=True
+        )
+        apply_detection.assert_called_once_with("test1234", TerminalStatus.IDLE)
+        backend.send_keys.assert_not_called()
+        backend.send_special_key.assert_not_called()
+
+    @pytest.mark.parametrize("command", [None, "", "bash", "zsh", "sh", "node", "unknown"])
+    def test_shell_or_unknown_foreground_never_recovers(self, command):
+        provider, backend = self.provider_and_backend()
+        backend.get_pane_current_command.return_value = command
+        with patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend):
+            assert provider._recover_startup_idle_status() is False
+        backend.get_history.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "screen",
+        [
+            "",
+            "OpenAI Codex (v0.166.0)\nloading",
+            "OpenAI Codex (v0.166.0)\n› this is an unsent task\nGPT-6.1-Sol · ~/repo",
+            (
+                "OpenAI Codex (v0.166.0)\n• Working (1s • esc to interrupt)\n"
+                "› Ask Codex to do anything\nGPT-6.1-Sol · ~/repo"
+            ),
+            (
+                "OpenAI Codex (v0.166.0)\nCommand Approval Required\n"
+                "› Ask Codex to do anything\nGPT-6.1-Sol · ~/repo"
+            ),
+            (
+                "OpenAI Codex (v0.166.0)\nError: unavailable\n"
+                "› Ask Codex to do anything\nGPT-6.1-Sol · ~/repo"
+            ),
+            "› Ask Codex to do anything\nGPT-6.1-Sol · ~/repo",
+        ],
+    )
+    def test_incomplete_draft_busy_dialog_error_or_no_banner_refuses(self, screen):
+        provider, backend = self.provider_and_backend()
+        backend.get_history.return_value = screen
+        with (
+            patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.status_monitor._apply_detection"
+            ) as apply_detection,
+        ):
+            assert provider._recover_startup_idle_status() is False
+        apply_detection.assert_not_called()
+
+    def test_native_backend_is_not_overridden(self):
+        provider, backend = self.provider_and_backend()
+        backend.supports_event_inbox.return_value = True
+        with patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend):
+            assert provider._recover_startup_idle_status() is False
+        backend.get_history.assert_not_called()
+
+    def test_lookup_failure_keeps_timeout(self):
+        provider, backend = self.provider_and_backend()
+        backend.get_history.side_effect = RuntimeError("lookup failed")
+        with patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend):
+            assert provider._recover_startup_idle_status() is False
+
+    @pytest.mark.asyncio
+    async def test_initialize_recovers_after_cached_timeout_without_replaying_input(self):
+        provider, backend = self.provider_and_backend()
+        with (
+            patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend),
+            patch(
+                "cli_agent_orchestrator.providers.codex.wait_for_shell",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.codex.wait_until_status",
+                new=AsyncMock(return_value=False),
+            ),
+            patch.object(provider, "_handle_trust_prompt", new=AsyncMock()),
+            patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new=AsyncMock()),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.status_monitor._apply_detection"
+            ) as apply_detection,
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
+                return_value=TerminalStatus.IDLE,
+            ),
+        ):
+            backend.get_pane_current_command.side_effect = ["bash", "codex", "codex"]
+            assert await provider.initialize() is True
+        assert provider._initialized is True
+        # Warm-up and CLI launch only. Task delivery remains terminal_service-owned.
+        assert backend.send_keys.call_count == 2
+        backend.send_special_key.assert_not_called()
+        apply_detection.assert_called_once_with("test1234", TerminalStatus.IDLE)
+
+    @pytest.mark.parametrize("baseline", [None, "", "unknown", "codex"])
+    @pytest.mark.parametrize("command", [None, "bash", "zsh", "codex", "unknown"])
+    def test_unknown_baseline_never_authorizes_fresh_ready(self, baseline, command):
+        provider, backend = self.provider_and_backend()
+        provider.shell_baseline = baseline
+        backend.get_pane_current_command.return_value = command
+        with patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend):
+            assert provider._recover_startup_idle_status() is False
+        backend.get_history.assert_not_called()
+
+    def test_foreground_exit_during_capture_refuses_stale_codex_screen(self):
+        provider, backend = self.provider_and_backend()
+        backend.get_pane_current_command.side_effect = ["codex", "bash"]
+        with (
+            patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.status_monitor._apply_detection"
+            ) as apply_detection,
+        ):
+            assert provider._recover_startup_idle_status() is False
+        apply_detection.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("baseline", [None, ""])
+    @pytest.mark.parametrize("foreground", ["bash", "zsh", "codex", None])
+    async def test_actual_initialize_keeps_timeout_with_unknown_shell(self, baseline, foreground):
+        provider, backend = self.provider_and_backend()
+        with (
+            patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend),
+            patch(
+                "cli_agent_orchestrator.providers.codex.wait_for_shell",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.codex.wait_until_status",
+                new=AsyncMock(return_value=False),
+            ),
+            patch.object(provider, "_handle_trust_prompt", new=AsyncMock()),
+            patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new=AsyncMock()),
+        ):
+            backend.get_pane_current_command.side_effect = [baseline, foreground]
+            with pytest.raises(TimeoutError, match="Codex initialization timed out"):
+                await provider.initialize()
+        assert provider._initialized is False
+        backend.get_history.assert_not_called()
+        # Only warm-up/CLI launch. A failed readiness check never pastes a task.
+        assert backend.send_keys.call_count == 2
+        backend.send_special_key.assert_not_called()
+
+    @pytest.mark.parametrize("use_screen", [False, True])
+    def test_real_monitor_reconciles_ready_and_requires_next_work(self, use_screen):
+        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+        provider, backend = self.provider_and_backend()
+        monitor = StatusMonitor()
+        terminal = provider.terminal_id
+        busy = (
+            "\x1b[2J\x1b[HOpenAI Codex (v0.166.0)\r\n"
+            "• Working (1s • esc to interrupt)\r\n"
+            "› Ask Codex to do anything\r\nGPT-6.1-Sol · ~/repo\r\n"
+        )
+
+        def detect_raw(terminal_id, buffer):
+            monitor._apply_detection(terminal_id, monitor._detect_status(terminal_id, buffer))
+
+        def detect_screen(terminal_id, actual_provider):
+            monitor._apply_detection(
+                terminal_id, monitor._detect_screen(terminal_id, actual_provider)
+            )
+
+        with (
+            patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend),
+            patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor", monitor),
+            patch("cli_agent_orchestrator.services.status_monitor.bus.publish"),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
+                return_value=provider,
+            ),
+            patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", use_screen),
+            patch.object(monitor, "_schedule_raw_detection", side_effect=detect_raw),
+            patch.object(monitor, "_schedule_screen_detection", side_effect=detect_screen),
+        ):
+            # Only scheduling is made synchronous. Real raw/pyte parsing,
+            # detector, locks, latch and input arm/buffer-clear all execute.
+            monitor._process_chunk(terminal, busy)
+            assert monitor.get_status(terminal) == TerminalStatus.PROCESSING
+            monitor.notify_input_sent(terminal)
+            assert provider._recover_startup_idle_status() is True
+            assert monitor.get_status(terminal) == TerminalStatus.IDLE
+            assert monitor._allow_processing_revert[terminal] is False
+
+            # A delayed pre-input busy frame cannot undo recovered readiness.
+            monitor._process_chunk(terminal, busy)
+            assert monitor.get_status(terminal) == TerminalStatus.IDLE
+
+            # Match send_input's actual arm/clear order, without sending keys.
+            monitor.notify_input_sent(terminal)
+            monitor.clear_rolling_buffer(terminal)
+            assert monitor.get_status(terminal) == TerminalStatus.IDLE
+            assert monitor._allow_processing_revert[terminal] is True
+
+            # Even a ready-to-ready late frame must preserve the next-input arm.
+            monitor._apply_detection(terminal, TerminalStatus.IDLE)
+            assert monitor._allow_processing_revert[terminal] is True
+            monitor._process_chunk(terminal, busy)
+            assert monitor.get_status(terminal) == TerminalStatus.PROCESSING
+            assert monitor._allow_processing_revert[terminal] is False
+        backend.send_keys.assert_not_called()
+        backend.send_special_key.assert_not_called()
+
+    def test_real_monitor_late_completed_latch_refuses_recovery(self):
+        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+        provider, backend = self.provider_and_backend()
+        monitor = StatusMonitor()
+        terminal = provider.terminal_id
+        with (
+            patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend),
+            patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor", monitor),
+            patch("cli_agent_orchestrator.services.status_monitor.bus.publish"),
+        ):
+            monitor._apply_detection(terminal, TerminalStatus.PROCESSING)
+            monitor._apply_detection(terminal, TerminalStatus.COMPLETED)
+            assert provider._recover_startup_idle_status() is False
+            assert monitor.get_status(terminal) == TerminalStatus.COMPLETED
+        backend.send_keys.assert_not_called()
